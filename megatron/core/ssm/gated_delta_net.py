@@ -19,7 +19,7 @@ from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.fp8_utils import get_fp8_align_size
-from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -29,6 +29,7 @@ from megatron.core.ssm.mamba_context_parallel import (
     _redo_attention_load_balancing,
     _undo_attention_load_balancing,
 )
+from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
@@ -45,13 +46,17 @@ from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx
 try:
     from fla.modules.convolution import causal_conv1d
     from fla.modules.l2norm import l2norm
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+    from fla.ops.gated_delta_rule import (
+        chunk_gated_delta_rule,
+        fused_recurrent_gated_delta_rule,
+    )
 
     HAVE_FLA = True
 except ImportError:
     causal_conv1d = None
     l2norm = None
     chunk_gated_delta_rule = None
+    fused_recurrent_gated_delta_rule = None
 
     HAVE_FLA = False
 
@@ -69,7 +74,7 @@ class GatedDeltaNetSubmodules:
     out_proj: Union[ModuleSpec, type] = IdentityOp
 
 
-class GatedDeltaNet(MegatronModule):
+class GatedDeltaNet(SSMDynamicInferenceMixin, MegatronModule):
     """Gated Delta Net (GDN) layer class
 
     GDN layer takes input with size [s, b, h]
@@ -81,6 +86,7 @@ class GatedDeltaNet(MegatronModule):
         config: TransformerConfig,
         submodules: GatedDeltaNetSubmodules,
         layer_number: int = None,
+        pp_layer_offset: int = 0,
         bias: bool = False,
         conv_bias: bool = False,
         conv_init: Optional[float] = None,
@@ -94,6 +100,7 @@ class GatedDeltaNet(MegatronModule):
             config: The config of the model.
             submodules: Contains the module specs for the input and output linear layers.
             layer_number: The layer number of this GDN layer.
+            pp_layer_offset: The global index of the first layer on this pipeline stage.
             bias: Whether to use bias in the linear layers.
             conv_bias: Whether to use bias in the causal convolution.
             conv_init: The initialization range for the causal convolution weights.
@@ -113,6 +120,7 @@ class GatedDeltaNet(MegatronModule):
 
         # Attributes from arguments
         self.layer_number = layer_number
+        self.pp_layer_offset = pp_layer_offset
         self.bias = bias
         self.conv_bias = conv_bias
         self.conv_init = conv_init
@@ -215,6 +223,9 @@ class GatedDeltaNet(MegatronModule):
         else:
             self.gated_delta_rule = chunk_gated_delta_rule
 
+        # Chunk size used by the delta rule kernels
+        self.chunk_size = 64
+
         # Output layernorm before projection
         self.out_norm = build_module(
             submodules.out_norm,
@@ -301,12 +312,12 @@ class GatedDeltaNet(MegatronModule):
         seq_len = seq_len * self.sp_size * self.cp_size
 
         if inference_context is not None:
-            assert (
-                inference_context.is_static_batching()
-            ), "GDN does not currently support dynamic inference batching."
+            if inference_context.is_dynamic_batching():
+                return self.ssm_dynamic_inference(hidden_states, inference_context)
+            assert inference_context.is_static_batching()
             assert not self.config.sequence_parallel
-            # TODO: support inference
-            raise NotImplementedError("GDN does not support inference for now.")
+            # TODO: support static-batching inference for GDN.
+            raise NotImplementedError("GDN static inference is not yet supported.")
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             assert batch == 1, "Packed sequence expects batch dimension to be 1"
@@ -549,6 +560,47 @@ class GatedDeltaNet(MegatronModule):
                 cu_seqlens=cu_seqlens_q,
             )
         return qkv
+
+    def ssm_state_shapes_per_request(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        """Return the per-request ``(conv_state, recurrent_state)`` cache shapes.
+
+        Mirrors :meth:`MambaMixer.ssm_state_shapes_per_request`
+        """
+        conv_states_shape = (self.conv_dim_local_tp, self.conv_kernel_dim)
+        recurrent_states_shape = (
+            self.num_v_heads_local_tp,
+            self.key_head_dim,
+            self.value_head_dim,
+        )
+        return (conv_states_shape, recurrent_states_shape)
+
+    def _ssm_decode(
+        self,
+        proj: Tensor,
+        conv_state: Tensor,
+        recurrent_state: Tensor,
+        batch_indices: Tensor,
+        intermediate_conv_state: Optional[Tensor] = None,
+        intermediate_recurrent_state: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Single-token-per-request recurrent decode for GDN.
+
+        See :meth:`SSMDynamicInferenceMixin._ssm_decode` for the contract.
+        """
+        raise NotImplementedError("GDN dynamic-inference decode.")
+
+    def _ssm_prefill(
+        self,
+        proj: Tensor,
+        conv_state: Tensor,
+        recurrent_state: Tensor,
+        context: Optional[DynamicInferenceContext] = None,
+    ) -> Tensor:
+        """Variable-length chunked prefill for GDN.
+
+        See :meth:`SSMDynamicInferenceMixin._ssm_prefill` for the contract.
+        """
+        raise NotImplementedError("GDN dynamic-inference prefill")
 
     @jit_fuser
     def _apply_gated_norm(self, x, gate):

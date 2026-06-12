@@ -54,7 +54,10 @@ class SSMInferenceStateConfig:
 
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_type_list = getattr(decoder, "layer_type_list", None)
-        if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
+        has_ssm_layer = layer_type_list is not None and (
+            Symbols.MAMBA in layer_type_list or Symbols.GDN in layer_type_list
+        )
+        if has_ssm_layer:
             (ssm_conv_states_shape, ssm_recurrent_states_shape) = (
                 decoder.ssm_state_shapes_per_request()
             )
@@ -66,6 +69,10 @@ class SSMInferenceStateConfig:
             for layer_type, layer in zip(decoder.layer_type_list, decoder.layers):
                 if layer_type == Symbols.MAMBA and hasattr(layer, 'mixer'):
                     ssm_chunk_size = layer.mixer.chunk_size
+                    break
+                # GDN is wrapped in a TransformerLayer
+                if layer_type == Symbols.GDN and hasattr(layer, 'self_attention'):
+                    ssm_chunk_size = layer.self_attention.chunk_size
                     break
             return cls(
                 layer_type_list=layer_type_list,
@@ -223,7 +230,7 @@ class InferenceConfig:
     """
     How CUDA graph token counts are spaced. EXPONENTIAL (default) halves from
     `cuda_graph_max_tokens` down to `tp_size` (log-spaced, ~log2(max_tokens) graphs).
-    LINEAR uses a range of linear strides (includes small graphs + mid-range linearity + 
+    LINEAR uses a range of linear strides (includes small graphs + mid-range linearity +
     a bigger step size at the top end).
     """
 

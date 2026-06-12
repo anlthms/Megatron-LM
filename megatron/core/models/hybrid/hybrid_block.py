@@ -181,6 +181,7 @@ class HybridStack(MegatronModule):
                         pg_collection=pg_collection,
                         # Set to False as we do not want to change offset.
                         add_layer_offset=False,
+                        pp_layer_offset=pp_layer_offset,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
                 else:
@@ -210,12 +211,15 @@ class HybridStack(MegatronModule):
 
     def ssm_state_shapes_per_request(self) -> Optional[Tuple[Tuple[int], Tuple[int]]]:
         """
-        Returns the Mamba conv and ssm states shapes per input sequence
-        if this block contains Mamba layers (this may not be the case with PP > 1).
+        Returns the SSM conv and recurrent state shapes per input sequence
+        if this block contains SSM layers (this may not be the case with PP > 1).
         """
         for layer_type, layer in zip(self.layer_type_list, self.layers):
             if layer_type == LayerSymbols.MAMBA:
                 return layer.ssm_state_shapes_per_request()
+            if layer_type == LayerSymbols.GDN:
+                # GDN is wrapped in a TransformerLayer
+                return layer.self_attention.ssm_state_shapes_per_request()
         return None
 
     def forward(
