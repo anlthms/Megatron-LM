@@ -72,7 +72,7 @@ def _make_transformer_config(tp_size: int) -> TransformerConfig:
     )
 
 
-def _build_gdn(config: TransformerConfig) -> GatedDeltaNet:
+def _build_gdn(config: TransformerConfig, dtype: torch.dtype = torch.bfloat16) -> GatedDeltaNet:
     pg_collection = ProcessGroupCollection(
         tp=parallel_state.get_tensor_model_parallel_group(),
         cp=parallel_state.get_context_parallel_group(),
@@ -89,7 +89,7 @@ def _build_gdn(config: TransformerConfig) -> GatedDeltaNet:
         A_init_range=(1, 16),
         pg_collection=pg_collection,
     )
-    return gdn.cuda().bfloat16()
+    return gdn.cuda().to(dtype)
 
 
 def _make_prefill_context(gdn, batch_indices, cu_seqlens, token_count):
@@ -315,3 +315,140 @@ class TestGatedDeltaNetInference:
                 torch.testing.assert_close(
                     out_dec[0, 0], y_ref[pos, 0], atol=atol, rtol=rtol
                 )
+
+
+def _parity_config(n_kheads, n_vheads, head_k, head_v, hidden=128) -> TransformerConfig:
+    """fp32 GDN config with configurable head dims for the FLA parity check."""
+    return TransformerConfig(
+        hidden_size=hidden,
+        linear_conv_kernel_dim=4,
+        linear_key_head_dim=head_k,
+        linear_value_head_dim=head_v,
+        linear_num_key_heads=n_kheads,
+        linear_num_value_heads=n_vheads,
+        num_layers=1,
+        normalization="RMSNorm",
+        use_cpu_initialization=True,
+        layernorm_zero_centered_gamma=True,
+        num_attention_heads=8,
+        activation_func=F.silu,
+        bf16=False,  # fp32 for a clean numerical comparison
+        tensor_model_parallel_size=1,
+        sequence_parallel=False,
+        context_parallel_size=1,
+        experimental_attention_variant="gated_delta_net",
+        linear_attention_freq=[1],
+        transformer_impl="transformer_engine",
+    )
+
+
+def _copy_fla_into_mcore(fla_layer, gdn):
+    """Load FLA's separate projections/convs/params into mcore's fused layout.
+
+    mcore fuses q/k/v/gate/beta/alpha into one ``in_proj`` and the three FLA
+    convs into one depthwise ``conv1d``. mcore's ``in_proj`` also fuses an input
+    RMSNorm (FLA's lives in the decoder block); it is neutralized by zeroing the
+    norm weight (zero-centered gamma -> scale 1) and feeding unit-RMS input.
+    """
+    with torch.no_grad():
+        # in_proj fused layout: [q | k | v | z(gate) | beta | alpha]
+        gdn.in_proj.weight.copy_(
+            torch.cat(
+                [
+                    fla_layer.q_proj.weight,
+                    fla_layer.k_proj.weight,
+                    fla_layer.v_proj.weight,
+                    fla_layer.g_proj.weight,  # -> z / gate
+                    fla_layer.b_proj.weight,  # -> beta
+                    fla_layer.a_proj.weight,  # -> alpha
+                ],
+                dim=0,
+            ).to(gdn.in_proj.weight.dtype)
+        )
+        gdn.in_proj.layer_norm_weight.zero_()  # neutralize fused input RMSNorm
+        # single fused depthwise conv = channel-concat of FLA's q/k/v convs
+        gdn.conv1d.weight.copy_(
+            torch.cat(
+                [fla_layer.q_conv1d.weight, fla_layer.k_conv1d.weight, fla_layer.v_conv1d.weight],
+                dim=0,
+            ).to(gdn.conv1d.weight.dtype)
+        )
+        gdn.A_log.copy_(fla_layer.A_log.to(gdn.A_log.dtype))
+        gdn.dt_bias.copy_(fla_layer.dt_bias.to(gdn.dt_bias.dtype))
+        # mcore uses zero-centered gamma (effective scale = 1 + weight); FLA's
+        # o_norm scales by weight directly. Subtract 1 so effective scales match.
+        gdn.out_norm.weight.copy_((fla_layer.o_norm.weight - 1.0).to(gdn.out_norm.weight.dtype))
+        gdn.out_proj.weight.copy_(fla_layer.o_proj.weight.to(gdn.out_proj.weight.dtype))
+
+
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.internal
+class TestGatedDeltaNetFLAParity:
+    """mcore GDN must match FLA's reference ``GatedDeltaNet`` on identical weights.
+
+    The hook tests above prove mcore is *self-consistent* (inference == its own
+    forward). This is the *external* fidelity check: mcore's hand-written glue
+    (fused in_proj split, single fused conv vs FLA's three, external g/beta and
+    q/k L2-norm vs FLA's in-kernel versions, gated RMSNorm) must reproduce the
+    canonical FLA layer -- including the grouped-value-attention repeat_interleave
+    path and head_v != head_k. Both share FLA's kernels, so a mismatch isolates an
+    mcore glue bug. Combined with the prefill+decode == forward invariant above,
+    this validates mcore's dynamic inference against an independent reference.
+    """
+
+    @pytest.fixture(scope="function", autouse=True)
+    def setup_method(self):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=1
+        )
+        model_parallel_cuda_manual_seed(123)
+        yield
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize(
+        "n_kheads,n_vheads,head_k,head_v",
+        [
+            (4, 4, 32, 32),  # no GVA, head_v == head_k
+            (4, 8, 32, 32),  # GVA (repeat_interleave path)
+            (4, 8, 32, 64),  # GVA + expand_v=2
+            (2, 8, 64, 128),  # GVA x4 + expand_v=2
+        ],
+    )
+    def test_matches_fla_reference(self, n_kheads, n_vheads, head_k, head_v):
+        import fla.layers.gated_deltanet as fla_gdn
+
+        torch.manual_seed(0)
+        config = _parity_config(n_kheads, n_vheads, head_k, head_v)
+        gdn = _build_gdn(config, dtype=torch.float32)
+
+        fla_layer = (
+            fla_gdn.GatedDeltaNet(
+                hidden_size=config.hidden_size,
+                expand_v=head_v / head_k,
+                head_dim=head_k,
+                num_heads=n_kheads,
+                num_v_heads=n_vheads,
+                mode="chunk",
+                use_gate=True,
+                use_short_conv=True,
+                conv_size=config.linear_conv_kernel_dim,
+                conv_bias=False,
+                layer_idx=0,
+            )
+            .cuda()
+            .float()
+        )
+        fla_layer.eval()
+        _copy_fla_into_mcore(fla_layer, gdn)
+
+        # Unit-RMS input per token so mcore's neutralized input RMSNorm is identity.
+        # seq_len > 64 so FLA's layer uses the chunk kernel (matches prefill).
+        hidden = torch.randn(1, 96, config.hidden_size, device="cuda", dtype=torch.float32)
+        hidden = hidden / hidden.pow(2).mean(-1, keepdim=True).add(1e-6).sqrt()
+
+        with torch.inference_mode():
+            o_fla, _, _ = fla_layer(hidden.clone())  # [B, T, H]
+            o_mc, _ = gdn(hidden.transpose(0, 1).clone(), attention_mask=None)  # [T, B, H]
+        o_mc = o_mc.transpose(0, 1)
+
+        torch.testing.assert_close(o_mc, o_fla, atol=1e-3, rtol=1e-3)
