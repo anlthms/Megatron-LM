@@ -347,12 +347,21 @@ class DynamicInferenceContext(BaseInferenceContext):
             # For hybrid models, the layer map converts the global layer index to the
             # corresponding attention layer index or SSM layer index depending on the
             # layer type.
-            attention_layer_map, dsa_layer_map, gdn_layer_map, ssm_layer_map = operator.itemgetter(
-                Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.GDN, Symbols.MAMBA
+            attention_layer_map, dsa_layer_map = operator.itemgetter(
+                Symbols.ATTENTION, Symbols.DS_ATTENTION
             )(get_layer_maps_from_layer_type_list(ssm_inference_state_config.layer_type_list))
 
-            if len(gdn_layer_map) > 0:
-                raise NotImplementedError("GDN layers are not supported for inference.")
+            # Mamba and GDN are both SSM-style mixers that share the SSM state cache.
+            # The per-symbol maps from get_layer_maps_from_layer_type_list are each
+            # 0-based within their own group, so they cannot be unioned directly. Build a
+            # single combined map with contiguous indices across both (in global layer
+            # order) so every SSM-style layer gets a unique state-cache slot.
+            ssm_layer_map = {}
+            for global_layer_idx, layer_type in enumerate(
+                ssm_inference_state_config.layer_type_list
+            ):
+                if layer_type in (Symbols.MAMBA, Symbols.GDN):
+                    ssm_layer_map[global_layer_idx] = len(ssm_layer_map)
 
             self.num_attention_layers = len(attention_layer_map) + len(dsa_layer_map)
             self.num_ssm_layers = len(ssm_layer_map)

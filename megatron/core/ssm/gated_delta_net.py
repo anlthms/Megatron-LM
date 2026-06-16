@@ -19,7 +19,10 @@ from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.fp8_utils import get_fp8_align_size
-from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
+from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
+    tensor_masked_update,
+)
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -29,6 +32,7 @@ from megatron.core.ssm.mamba_context_parallel import (
     _redo_attention_load_balancing,
     _undo_attention_load_balancing,
 )
+from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
@@ -45,13 +49,17 @@ from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx
 try:
     from fla.modules.convolution import causal_conv1d
     from fla.modules.l2norm import l2norm
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+    from fla.ops.gated_delta_rule import (
+        chunk_gated_delta_rule,
+        fused_recurrent_gated_delta_rule,
+    )
 
     HAVE_FLA = True
 except ImportError:
     causal_conv1d = None
     l2norm = None
     chunk_gated_delta_rule = None
+    fused_recurrent_gated_delta_rule = None
 
     HAVE_FLA = False
 
@@ -69,7 +77,7 @@ class GatedDeltaNetSubmodules:
     out_proj: Union[ModuleSpec, type] = IdentityOp
 
 
-class GatedDeltaNet(MegatronModule):
+class GatedDeltaNet(SSMDynamicInferenceMixin, MegatronModule):
     """Gated Delta Net (GDN) layer class
 
     GDN layer takes input with size [s, b, h]
@@ -81,6 +89,7 @@ class GatedDeltaNet(MegatronModule):
         config: TransformerConfig,
         submodules: GatedDeltaNetSubmodules,
         layer_number: int = None,
+        pp_layer_offset: int = 0,
         bias: bool = False,
         conv_bias: bool = False,
         conv_init: Optional[float] = None,
@@ -94,6 +103,7 @@ class GatedDeltaNet(MegatronModule):
             config: The config of the model.
             submodules: Contains the module specs for the input and output linear layers.
             layer_number: The layer number of this GDN layer.
+            pp_layer_offset: The global index of the first layer on this pipeline stage.
             bias: Whether to use bias in the linear layers.
             conv_bias: Whether to use bias in the causal convolution.
             conv_init: The initialization range for the causal convolution weights.
@@ -113,6 +123,7 @@ class GatedDeltaNet(MegatronModule):
 
         # Attributes from arguments
         self.layer_number = layer_number
+        self.pp_layer_offset = pp_layer_offset
         self.bias = bias
         self.conv_bias = conv_bias
         self.conv_init = conv_init
@@ -215,6 +226,9 @@ class GatedDeltaNet(MegatronModule):
         else:
             self.gated_delta_rule = chunk_gated_delta_rule
 
+        # Chunk size used by the delta rule kernels
+        self.chunk_size = 64
+
         # Output layernorm before projection
         self.out_norm = build_module(
             submodules.out_norm,
@@ -301,12 +315,12 @@ class GatedDeltaNet(MegatronModule):
         seq_len = seq_len * self.sp_size * self.cp_size
 
         if inference_context is not None:
-            assert (
-                inference_context.is_static_batching()
-            ), "GDN does not currently support dynamic inference batching."
+            if inference_context.is_dynamic_batching():
+                return self.ssm_dynamic_inference(hidden_states, inference_context)
+            assert inference_context.is_static_batching()
             assert not self.config.sequence_parallel
-            # TODO: support inference
-            raise NotImplementedError("GDN does not support inference for now.")
+            # TODO: support static-batching inference for GDN.
+            raise NotImplementedError("GDN static inference is not yet supported.")
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             assert batch == 1, "Packed sequence expects batch dimension to be 1"
@@ -389,68 +403,12 @@ class GatedDeltaNet(MegatronModule):
         qkvzba = qkvzba.transpose(0, 1)
 
         # Split, reorder, and reshape the tensor into q, k, v, gate, beta, alpha
-        qkv, gate, beta, alpha = torch.split(
-            qkvzba,
-            [
-                (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // self.cp_size,
-                self.v_dim_local_tp // self.cp_size,
-                self.num_value_heads // self.tp_size // self.cp_size,
-                self.num_value_heads // self.tp_size // self.cp_size,
-            ],
-            dim=-1,
-        )
-        gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
-        beta = beta.reshape(batch, seq_len, -1)
-        alpha = alpha.reshape(batch, seq_len, -1)
+        qkv, gate, beta, alpha = self._split_projection(qkvzba, batch, seq_len)
+        seq_len = qkv.shape[1]
 
         # Convolution on qkv
         nvtx_range_push(suffix="conv1d")
-        seq_len = qkv.shape[1]
-        qkv_channels_split_sections = [
-            self.qk_dim_local_tp,
-            self.qk_dim_local_tp,
-            self.v_dim_local_tp,
-        ]
-        conv1d_weight = get_parameter_local_cp(
-            self.conv1d.weight,
-            dim=0,
-            cp_group=self.pg_collection.cp,
-            split_sections=qkv_channels_split_sections,
-        )
-        conv1d_bias = (
-            get_parameter_local_cp(
-                self.conv1d.bias,
-                dim=0,
-                cp_group=self.pg_collection.cp,
-                split_sections=qkv_channels_split_sections,
-            )
-            if self.conv_bias
-            else None
-        )
-        if self.config.deterministic_mode:
-            qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
-            conv_out = F.conv1d(
-                input=qkv,  # Torch-native only accept [b, d, s] format input
-                weight=conv1d_weight,
-                bias=conv1d_bias,
-                stride=self.conv1d.stride,
-                padding=self.conv1d.padding,
-                dilation=self.conv1d.dilation,
-                groups=self.conv_dim_local_tp // self.cp_size,
-            )
-            qkv = self.act_fn(conv_out[..., :seq_len])
-            qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
-        else:
-            assert self.activation in ["silu", "swish"]
-            qkv, _ = causal_conv1d(
-                x=qkv,  # FLA conv1d accepts [b, s, d] format input
-                weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
-                bias=conv1d_bias,
-                activation=self.activation,
-                initial_state=None,
-                output_final_state=False,
-                cu_seqlens=cu_seqlens_q,
-            )
+        qkv = self._apply_conv(qkv, cu_seqlens_q)
         nvtx_range_pop(suffix="conv1d")
 
         # Prepare QKV tensors (split, reshape, L2 norm, repeat_interleave, contiguous)
@@ -527,6 +485,232 @@ class GatedDeltaNet(MegatronModule):
             self.norm_out_checkpoint.discard_output_and_register_recompute(out)
 
         return out, out_bias
+
+    def _split_projection(
+        self, qkvzba: Tensor, batch: int, seq_len: int
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Split the input projection output into (qkv, gate, beta, alpha).
+
+        ``qkv`` keeps the concatenated query/key/value channels (they share the short
+        convolution); gate, beta, and alpha are reshaped to per-head layouts.
+        """
+        qkv, gate, beta, alpha = torch.split(
+            qkvzba,
+            [
+                (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // self.cp_size,
+                self.v_dim_local_tp // self.cp_size,
+                self.num_value_heads // self.tp_size // self.cp_size,
+                self.num_value_heads // self.tp_size // self.cp_size,
+            ],
+            dim=-1,
+        )
+        gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
+        beta = beta.reshape(batch, seq_len, -1)
+        alpha = alpha.reshape(batch, seq_len, -1)
+        return qkv, gate, beta, alpha
+
+    def _apply_conv(self, qkv: Tensor, cu_seqlens_q: Optional[Tensor]) -> Tensor:
+        """Apply the depthwise causal short convolution to the concatenated qkv channels.
+
+        Expects ``qkv`` in ``[b, s, d]`` layout and returns the activated convolution
+        output in the same layout. ``cu_seqlens_q`` selects the varlen path when packing
+        sequences (FLA backend only).
+        """
+        seq_len = qkv.shape[1]
+        qkv_channels_split_sections = [
+            self.qk_dim_local_tp,
+            self.qk_dim_local_tp,
+            self.v_dim_local_tp,
+        ]
+        conv1d_weight = get_parameter_local_cp(
+            self.conv1d.weight,
+            dim=0,
+            cp_group=self.pg_collection.cp,
+            split_sections=qkv_channels_split_sections,
+        )
+        conv1d_bias = (
+            get_parameter_local_cp(
+                self.conv1d.bias,
+                dim=0,
+                cp_group=self.pg_collection.cp,
+                split_sections=qkv_channels_split_sections,
+            )
+            if self.conv_bias
+            else None
+        )
+        if self.config.deterministic_mode:
+            qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
+            conv_out = F.conv1d(
+                input=qkv,  # Torch-native only accept [b, d, s] format input
+                weight=conv1d_weight,
+                bias=conv1d_bias,
+                stride=self.conv1d.stride,
+                padding=self.conv1d.padding,
+                dilation=self.conv1d.dilation,
+                groups=self.conv_dim_local_tp // self.cp_size,
+            )
+            qkv = self.act_fn(conv_out[..., :seq_len])
+            qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
+        else:
+            assert self.activation in ["silu", "swish"]
+            qkv, _ = causal_conv1d(
+                x=qkv,  # FLA conv1d accepts [b, s, d] format input
+                weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
+                bias=conv1d_bias,
+                activation=self.activation,
+                initial_state=None,
+                output_final_state=False,
+                cu_seqlens=cu_seqlens_q,
+            )
+        return qkv
+
+    def ssm_state_shapes_per_request(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        """Return the per-request ``(conv_state, recurrent_state)`` cache shapes.
+
+        Mirrors :meth:`MambaMixer.ssm_state_shapes_per_request`
+        """
+        conv_states_shape = (self.conv_dim_local_tp, self.conv_kernel_dim)
+        recurrent_states_shape = (
+            self.num_v_heads_local_tp,
+            self.key_head_dim,
+            self.value_head_dim,
+        )
+        return (conv_states_shape, recurrent_states_shape)
+
+    def _conv_decode_step(
+        self, qkv: Tensor, conv_state: Tensor, batch_indices: Tensor
+    ) -> Tensor:
+        """Advance the depthwise causal conv by one token
+
+        ``qkv`` is ``[N, 1, conv_dim]`` and ``conv_state`` is
+        ``[num_slots, conv_dim, d_conv]``. Each active slot's window is rolled by one
+        and the new token appended.
+        """
+        x = qkv.squeeze(1).to(conv_state.dtype)  # [N, conv_dim]
+        conv_window = conv_state[batch_indices]  # [N, conv_dim, d_conv]
+        conv_window = torch.roll(conv_window, shifts=-1, dims=-1)
+        conv_window[:, :, -1] = x
+        tensor_masked_update(conv_state, batch_indices, conv_window)
+
+        weight = self.conv1d.weight.squeeze(1).to(conv_state.dtype)  # [conv_dim, d_conv]
+        out = torch.sum(conv_window * weight, dim=-1)  # [N, conv_dim]
+        if self.conv_bias:
+            out = out + self.conv1d.bias.to(conv_state.dtype)
+        out = self.act_fn(out)
+        return out.to(qkv.dtype).unsqueeze(1)  # [N, 1, conv_dim]
+
+    def _ssm_decode(
+        self,
+        proj: Tensor,
+        conv_state: Tensor,
+        recurrent_state: Tensor,
+        batch_indices: Tensor,
+        intermediate_conv_state: Optional[Tensor] = None,
+        intermediate_recurrent_state: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Single-token-per-request recurrent decode for GDN.
+
+        See :meth:`SSMDynamicInferenceMixin._ssm_decode` for the contract. State is
+        gathered per active slot, advanced one token by the fused recurrent kernel,
+        and written back in place.
+        """
+        assert self.cp_size == 1, "Context parallel is not supported for GDN dynamic inference."
+        decode_req_count, seq_len, _ = proj.shape
+        assert seq_len == 1, (
+            "GDN dynamic-inference decode does not yet support speculative decoding "
+            "(seq_len > 1)."
+        )
+        assert intermediate_conv_state is None and intermediate_recurrent_state is None, (
+            "GDN dynamic-inference decode does not yet support speculative-decoding "
+            "intermediate-state capture."
+        )
+
+        qkv, gate, beta, alpha = self._split_projection(proj, decode_req_count, seq_len)
+
+        # Single-step conv update on the active slots
+        qkv = self._conv_decode_step(qkv, conv_state, batch_indices)
+
+        # Prepare q/k/v and gating terms (shared with the training path).
+        query, key, value, gate, beta, alpha = self._prepare_qkv_for_gated_delta_rule(
+            qkv, gate, beta, alpha, decode_req_count, seq_len
+        )
+        g, beta = self._compute_g_and_beta(self.A_log, self.dt_bias, alpha, beta)
+
+        # Gather each request's recurrent state, advance it by one token, write back.
+        initial_recurrent_state = recurrent_state[batch_indices]
+        core_attn_out, last_recurrent_state = fused_recurrent_gated_delta_rule(
+            query, key, value,
+            g=g, beta=beta, initial_state=initial_recurrent_state,
+            output_final_state=True, use_qk_l2norm_in_kernel=False,
+        )
+        tensor_masked_update(
+            recurrent_state, batch_indices, last_recurrent_state.to(recurrent_state.dtype)
+        )
+
+        # Gated RMSNorm, then restore the [N, S, d_inner] layout.
+        y = self._apply_gated_norm(core_attn_out, gate)
+        return y.reshape(decode_req_count, seq_len, -1)
+
+    def _ssm_prefill(
+        self,
+        proj: Tensor,
+        conv_state: Tensor,
+        recurrent_state: Tensor,
+        context: Optional[DynamicInferenceContext] = None,
+    ) -> Tensor:
+        """Variable-length chunked prefill for GDN.
+
+        See :meth:`SSMDynamicInferenceMixin._ssm_prefill` for the contract. Reuses the
+        training compute path, but seeds the conv and recurrent kernels with each request's
+        cached state and writes the final states back into the slot cache.
+        """
+        assert self.cp_size == 1, "Context parallel is not supported for GDN dynamic inference."
+        if context is None:
+            raise NotImplementedError("GDN static-batching prefill is not yet supported.")
+
+        metadata = context.ssm_metadata
+        cu_seqlens = metadata.cu_seqlens
+        batch_indices = metadata.batch_indices_prefill
+
+        token_count = proj.shape[0]
+        proj = proj.transpose(0, 1).contiguous()
+        qkv, gate, beta, alpha = self._split_projection(proj, 1, token_count)
+
+        conv_state_dtype = conv_state.dtype
+        qkv_dtype = qkv.dtype
+        initial_conv_state = conv_state[batch_indices]
+        conv_weight = self.conv1d.weight.squeeze(1).to(conv_state_dtype)
+        conv_bias = self.conv1d.bias.to(conv_state_dtype) if self.conv_bias else None
+        qkv, final_conv_state = causal_conv1d(
+            x=qkv.to(conv_state_dtype), weight=conv_weight, bias=conv_bias,
+            activation=self.activation, initial_state=initial_conv_state,
+            output_final_state=True, cu_seqlens=cu_seqlens,
+        )
+        qkv = qkv.to(qkv_dtype)
+        tensor_masked_update(conv_state, batch_indices, final_conv_state.to(conv_state.dtype))
+
+        # Prepare q/k/v and gating terms (shared with the training path).
+        query, key, value, gate, beta, alpha = self._prepare_qkv_for_gated_delta_rule(
+            qkv, gate, beta, alpha, 1, token_count
+        )
+        g, beta = self._compute_g_and_beta(self.A_log, self.dt_bias, alpha, beta)
+
+        # Chunked varlen delta rule seeded with each request's recurrent state, with
+        # final-state write-back.
+        initial_recurrent_state = recurrent_state[batch_indices]
+        core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
+            query, key, value,
+            g=g, beta=beta, initial_state=initial_recurrent_state,
+            output_final_state=True, use_qk_l2norm_in_kernel=False, cu_seqlens=cu_seqlens
+        )
+        tensor_masked_update(
+            recurrent_state, batch_indices, last_recurrent_state.to(recurrent_state.dtype)
+        )
+
+        # Gated RMSNorm, then restore the [prefill_token_count, 1, d_inner] layout.
+        y = self._apply_gated_norm(core_attn_out, gate)
+        y = y.reshape(1, token_count, -1).transpose(0, 1).contiguous()
+        return y
 
     @jit_fuser
     def _apply_gated_norm(self, x, gate):
