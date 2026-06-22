@@ -6,6 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import os
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import Optional, Union
@@ -48,6 +49,7 @@ from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx
 
 try:
     from fla.modules.convolution import causal_conv1d
+    from fla.modules.fused_norm_gate import rms_norm_gated
     from fla.modules.l2norm import l2norm
     from fla.ops.gated_delta_rule import (
         chunk_gated_delta_rule,
@@ -58,6 +60,7 @@ try:
 except ImportError:
     causal_conv1d = None
     l2norm = None
+    rms_norm_gated = None
     chunk_gated_delta_rule = None
     fused_recurrent_gated_delta_rule = None
 
@@ -240,6 +243,15 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, MegatronModule):
         self.norm_out_checkpoint = None
         if self.config.recompute_granularity == "selective":
             self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
+
+        # PROTOTYPE (default off): fuse the gated RMSNorm + silu-gate into FLA's
+        # single Triton kernel (rms_norm_gated) instead of out_norm + an external
+        # gate multiply. Enable with MCORE_GDN_FUSED_GATED_NORM=1. See
+        # _apply_gated_norm. Reuses self.out_norm.weight so checkpoints are
+        # unchanged; the (1 + weight) zero-centered-gamma scaling is applied here.
+        self._use_fused_gated_norm = (
+            os.environ.get("MCORE_GDN_FUSED_GATED_NORM", "0") == "1" and rms_norm_gated is not None
+        )
 
         self.out_proj = build_module(
             submodules.out_proj,
@@ -717,9 +729,20 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, MegatronModule):
         # Output Norm
         x_dtype = x.dtype
         x = x.reshape(-1, x.shape[-1])
+        gate = gate.reshape(-1, gate.shape[-1])
+        if self._use_fused_gated_norm:
+            # Single fused Triton kernel: RMSNorm(x) * weight * silu(gate).
+            # out_norm has no bias; apply the (1 + weight) zero-centered-gamma
+            # scaling here so numerics match the eager path below.
+            weight = self.out_norm.weight
+            if self.config.layernorm_zero_centered_gamma:
+                weight = 1.0 + weight
+            y = rms_norm_gated(
+                x, gate, weight, None, activation="swish", eps=self.config.layernorm_epsilon
+            )
+            return y.to(x_dtype)
         y = self.out_norm(x)
         # Output gate
-        gate = gate.reshape(-1, gate.shape[-1])
         y = y * self.act_fn(gate.float())
         y = y.to(x_dtype)
         return y
