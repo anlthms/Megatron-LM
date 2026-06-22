@@ -1,38 +1,48 @@
 #!/bin/bash
 # Tutorial: Train a small hybrid (Mamba + attention) model with Megatron-LM.
 #
-# This is the sbatch version — submit it from a login node:
+# Context is detected automatically:
 #
-#   sbatch examples/training_scripts/tutorial_hybrid_batch.sh
+#   Login node (no GPU allocation):
+#     bash examples/training_scripts/train_hybrid.sh
+#     -> self-submits as a batch job via sbatch, then exits.
 #
-# For the interactive-node version (no scheduler), see
-# tutorial_hybrid_interactive.sh.
+#   Interactive compute node (after start_interactive_node.sh):
+#     bash examples/training_scripts/train_hybrid.sh
+#     -> runs training directly with torchrun.
+#
+#   Direct batch submission:
+#     sbatch examples/training_scripts/train_hybrid.sh
+#
+# Override defaults before running:
+#   ROOT_DIR=/my/path USE_MOCK_DATA=false bash ...
 #
 # Model: 16-layer hybrid, ~300 M params.
 # Layer pattern: MMM*MMM*MMM*MMM*  (12 Mamba + 4 attention layers)
 #   M = Mamba (state-space) layer
 #   * = multi-head attention layer
 #
-# Data modes (set USE_MOCK_DATA before submitting):
+# Data modes:
 #   USE_MOCK_DATA=true  (default) — synthetic data, no setup.
-#   USE_MOCK_DATA=false — Common Pile CI dataset: 12 M sequences / ~12.7 B
-#       tokens, GPT-2 BPE tokenized, already preprocessed.  Same dataset
-#       used by all Megatron-LM functional tests.  No extra setup needed.
+#   USE_MOCK_DATA=false — Common Pile CI dataset (12 M sequences / ~12.7 B
+#       tokens, GPT-2 BPE).  Same dataset as Megatron-LM functional tests.
 #
-# Runtime: ≈5 min on 4 H100s.
+# Runtime: ≈2 min on 1 H100 (mock data, 100 samples).
 
+# ---------------------------------------------------------------------------
+# SLURM batch directives — read by sbatch; treated as comments otherwise.
+# ---------------------------------------------------------------------------
 #SBATCH -p interactive
 #SBATCH --account=nemotron_sw_pre
 #SBATCH --nodes=1
 #SBATCH -t 0:30:00
 #SBATCH --mem=0
-# Adjust ntasks-per-node / gpus-per-node to match your node type.
-# H100 nodes: 8 GPUs/node.  GB200/GB300 nodes: 4 GPUs/node.
-# This script defaults to 4 GPUs so it runs on either type without change.
-#SBATCH --ntasks-per-node=4
+#SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --dependency=singleton
-#SBATCH --job-name=tutorial_hybrid
+#SBATCH --job-name=train_hybrid
+
+set -euo pipefail
 
 # ---------------------------------------------------------------------------
 # Environment
@@ -40,21 +50,21 @@
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NVTE_FWD_LAYERNORM_SM_MARGIN=16
 export NVTE_BWD_LAYERNORM_SM_MARGIN=16
-export NVTE_FUSED_ATTN=0   # disable cuDNN fused attention
+export NVTE_FUSED_ATTN=0
 
 # ---------------------------------------------------------------------------
-# Paths — set ROOT_DIR to a directory you have write access to.
-# It should be the parent of megatron-lm/ and images/.
+# Paths
 #
-# Example: ROOT_DIR="/lustre/fsw/portfolios/nemotron/projects/nemotron_sw_pre/users/$(whoami)"
+# ROOT_DIR must be the parent of megatron-lm/ and images/ on the shared Lustre
+# filesystem.  It is accessible from login nodes, compute nodes, and inside
+# containers (/lustre is mounted everywhere).
 # ---------------------------------------------------------------------------
-ROOT_DIR=""
+ROOT_DIR="${ROOT_DIR:-/lustre/fsw/portfolios/nemotron/projects/nemotron_sw_pre/users/$(whoami)}"
 REPO_DIR="${ROOT_DIR}/megatron-lm"
-NAME="tutorial_hybrid"
 IMAGE_PATH="${ROOT_DIR}/images/mcore_ci_lts.sqsh"
 
+NAME="train_hybrid"
 DATETIME=$(date +'date_%y-%m-%d_time_%H-%M-%S')
-
 RUN_DIR="${ROOT_DIR}/${NAME}"
 LOGS_DIR="${RUN_DIR}/logs"
 CHECKPOINT_DIR="${RUN_DIR}/checkpoints"
@@ -64,21 +74,25 @@ TENSORBOARD_DIR="${RUN_DIR}/tensorboard"
 mkdir -p "${LOGS_DIR}" "${CHECKPOINT_DIR}" "${DATACACHE_DIR}" "${TENSORBOARD_DIR}"
 
 # ---------------------------------------------------------------------------
+# GPU count — detected early so GLOBAL_BATCH_SIZE is available for options.
+# Defaults to 4 on login nodes where nvidia-smi is unavailable; the actual
+# count is re-detected when the script runs inside the container.
+# ---------------------------------------------------------------------------
+GPUS_PER_NODE=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)
+GPUS_PER_NODE=$(( GPUS_PER_NODE > 0 ? GPUS_PER_NODE : 4 ))
+
+# ---------------------------------------------------------------------------
 # Data
 # ---------------------------------------------------------------------------
 USE_MOCK_DATA="${USE_MOCK_DATA:-true}"
 
-# The Megatron-LM CI dataset: Common Pile v0.1, tokenized with GPT-2 BPE.
-# 12 M sequences / ~12.7 B tokens — the same dataset all functional tests use.
-# Already preprocessed; no extra setup needed.
-# Canonical cluster path (mapped to /mnt/artifacts inside CI containers).
+# Common Pile v0.1, GPT-2 BPE tokenized.  12 M sequences / ~12.7 B tokens.
+# Already preprocessed — the same dataset used by all functional tests.
+# Canonical path on this cluster (mapped to /mnt/artifacts inside CI containers).
 CI_DATA_ROOT="/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_mcore/mcore_ci"
 DATA_PATH="${CI_DATA_ROOT}/text/common_pile/v01_filtered_data/my-gpt3_00_text_document"
 GPT2_VOCAB="${CI_DATA_ROOT}/text/common_pile/v01_filtered_data/bpe/vocab.json"
 GPT2_MERGES="${CI_DATA_ROOT}/text/common_pile/v01_filtered_data/bpe/merges.txt"
-
-# To learn how this dataset was built from raw text, see:
-#   tools/common_pile_dataset/README.md  (download + preprocess_data.py pipeline)
 
 if [ "${USE_MOCK_DATA}" = "true" ]; then
     data_options="--mock-data"
@@ -97,10 +111,10 @@ fi
 
 # ---------------------------------------------------------------------------
 # W&B logging — uncomment and fill in to enable.
-# Requires `wandb login` (or WANDB_API_KEY set) inside the container.
+# Requires wandb login (or WANDB_API_KEY set) inside the container.
 # ---------------------------------------------------------------------------
 # WANDB_PROJECT="megatron-tutorial"
-# WANDB_EXP_NAME="${NAME}_$(date +%Y%m%d_%H%M%S)"
+# WANDB_EXP_NAME="${NAME}_${DATETIME}"
 # wandb_options=" \
 #     --wandb-project ${WANDB_PROJECT} \
 #     --wandb-exp-name ${WANDB_EXP_NAME} \
@@ -110,8 +124,8 @@ wandb_options=""
 # ---------------------------------------------------------------------------
 # Model and training options
 # ---------------------------------------------------------------------------
-# Hybrid layer pattern: repeat [3 Mamba, 1 attention] four times = 16 layers.
-# Swap in G (GDN), D (DSA), or E (MoE) to experiment with other layer types.
+# Layer pattern: [3 Mamba + 1 attention] × 4 = 16 layers.
+# Replace M with G (GDN), D (DSA), or E (MoE) to try other layer types.
 HYBRID_PATTERN="MMM*MMM*MMM*MMM*"
 
 options=" \
@@ -136,21 +150,21 @@ options=" \
     --bf16 \
     --seq-length 4096 \
     --max-position-embeddings 4096 \
-    --train-samples 800 \
+    --train-samples 100 \
     --lr-decay-style WSD \
-    --lr-decay-samples 800 \
-    --lr-warmup-samples 20 \
+    --lr-decay-samples 100 \
+    --lr-warmup-samples 5 \
     --lr-wsd-decay-style minus_sqrt \
-    --lr-wsd-decay-samples 160 \
+    --lr-wsd-decay-samples 20 \
     --micro-batch-size 1 \
-    --global-batch-size 4 \
+    --global-batch-size ${GPUS_PER_NODE} \
     --lr 8e-4 \
     --min-lr 8e-6 \
     --weight-decay 0.1 \
     --clip-grad 1.0 \
     --adam-beta1 0.9 \
     --adam-beta2 0.95 \
-    --eval-interval 100 \
+    --eval-interval 50 \
     --eval-iters 5 \
     \
     ${data_options} \
@@ -166,9 +180,9 @@ options=" \
     --ckpt-format torch_dist \
     --load ${CHECKPOINT_DIR} \
     --save ${CHECKPOINT_DIR} \
-    --save-interval 400 \
+    --save-interval 100 \
     \
-    --log-interval 10 \
+    --log-interval 5 \
     --log-params-norm \
     --log-num-zeros-in-grad \
     --log-throughput \
@@ -181,13 +195,38 @@ options=" \
     --disable-gloo-process-groups "
 
 # ---------------------------------------------------------------------------
-# Train
+# Launch
+#
+# Phase 1 — login node (no SLURM allocation): self-submit as a batch job.
+# Phase 2 — batch job, outside container: launch container and re-invoke.
+#            INSIDE_CONTAINER=1 is passed to break the recursion.
+# Phase 3 — inside container (batch) or interactive session: run training.
+#
+# start_interactive_node.sh sets INSIDE_CONTAINER=1 when entering a shell,
+# so interactive sessions skip Phase 2 and go directly to Phase 3.
 # ---------------------------------------------------------------------------
-run_cmd="python -u ${REPO_DIR}/pretrain_hybrid.py ${options}"
+SCRIPT_ABS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
-srun -l \
-    --container-image "${IMAGE_PATH}" \
-    --container-mounts "/lustre:/lustre" \
-    --no-container-mount-home \
-    --output="${LOGS_DIR}/%x_%j_${DATETIME}.log" \
-    sh -c "${run_cmd}"
+if [ -z "${SLURM_JOB_ID:-}" ]; then
+    echo "No SLURM allocation — submitting batch job."
+    exec sbatch "${SCRIPT_ABS}"
+
+elif [ -z "${INSIDE_CONTAINER:-}" ]; then
+    exec srun -l \
+        --ntasks=1 \
+        --container-image "${IMAGE_PATH}" \
+        --container-mounts "/lustre:/lustre" \
+        --no-container-mount-home \
+        --output="${LOGS_DIR}/%x_%j_${DATETIME}.log" \
+        sh -c "INSIDE_CONTAINER=1 bash ${SCRIPT_ABS}"
+fi
+
+echo "Launching ${GPUS_PER_NODE}-GPU training."
+echo "Checkpoints: ${CHECKPOINT_DIR}"
+
+torchrun \
+    --standalone \
+    --nnodes=1 \
+    --nproc-per-node="${GPUS_PER_NODE}" \
+    "${REPO_DIR}/pretrain_hybrid.py" \
+    ${options}
