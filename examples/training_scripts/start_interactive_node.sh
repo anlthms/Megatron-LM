@@ -8,6 +8,9 @@
 #   /opt/megatron-lm  ->  your megatron-lm checkout on Lustre
 #   /lustre           ->  full cluster Lustre filesystem
 #
+# Then run the training tutorial (for example):
+#   bash examples/training_scripts/train_hybrid.sh
+#
 # Override defaults:
 #   ROOT_DIR=...  GPUS_PER_NODE=8  TIME=4:00:00  bash start_interactive_node.sh
 
@@ -23,9 +26,7 @@ IMAGE="${IMAGE:-${ROOT_DIR}/images/mcore_ci_lts.sqsh}"
 MOUNTS="/lustre:/lustre"
 MOUNTS+=",${ROOT_DIR}/megatron-lm:/opt/megatron-lm"
 
-# INSIDE_CONTAINER=1 tells tutorial_hybrid.sh that the container is already
-# set up and it should skip directly to running torchrun.
-INIT="export INSIDE_CONTAINER=1; cd /opt/megatron-lm; exec /bin/bash"
+INIT="cd /opt/megatron-lm; exec /bin/bash"
 
 exec srun \
     --nodes=1 \
