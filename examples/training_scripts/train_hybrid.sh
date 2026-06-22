@@ -38,7 +38,7 @@
 #SBATCH --dependency=singleton
 #SBATCH --job-name=train_hybrid
 
-set -euo pipefail
+set -eu
 
 # ---------------------------------------------------------------------------
 # Environment
@@ -55,7 +55,16 @@ export NVTE_FUSED_ATTN=0
 # filesystem. It is accessible from login nodes, compute nodes, and inside
 # containers (/lustre is mounted everywhere).
 # ---------------------------------------------------------------------------
-ROOT_DIR="${ROOT_DIR:-/lustre/fsw/portfolios/nemotron/projects/nemotron_sw_pre/users/$(whoami)}"
+# whoami returns 'root' inside containers, so we rely on ROOT_DIR being set
+# explicitly (forwarded by start_interactive_node.sh) or on SLURM_JOB_USER
+# (set by SLURM to the submitting account for batch jobs).
+if [ -z "${ROOT_DIR:-}" ]; then
+    if [ -z "${SLURM_JOB_USER:-}" ]; then
+        echo "Error: set ROOT_DIR to the parent of megatron-lm/ on Lustre." >&2
+        exit 1
+    fi
+    ROOT_DIR="/lustre/fsw/portfolios/nemotron/projects/nemotron_sw_pre/users/${SLURM_JOB_USER}"
+fi
 REPO_DIR="${ROOT_DIR}/megatron-lm"
 
 NAME="train_hybrid"

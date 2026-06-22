@@ -29,7 +29,9 @@ MOUNTS+=",${ROOT_DIR}/megatron-lm:/opt/megatron-lm"
 MOUNTS+=",${HOME}:${HOME}"
 
 # Export HOME so tools that look up ~/.config, ~/.claude, etc. find the right path.
-INIT="export HOME='${HOME}'; export PATH=\"\$HOME/.local/bin:\$PATH\"; cd /opt/megatron-lm; exec /bin/bash"
+# ROOT_DIR and HOME are evaluated here (login node, real user) and forwarded
+# into the container, where whoami returns root.
+INIT="export HOME='${HOME}'; export ROOT_DIR='${ROOT_DIR}'; export PATH=\"\$HOME/.local/bin:\$PATH\"; cd /opt/megatron-lm; exec /bin/bash"
 
 exec srun \
     --nodes=1 \
