@@ -11,19 +11,17 @@
 #     bash examples/training_scripts/train_hybrid.sh
 #
 # Override defaults:
-#   ROOT_DIR=/my/path USE_MOCK_DATA=false bash ...
+#   ROOT_DIR=/my/path bash ...
 #
 # Model: 16-layer hybrid, ~300 M params.
 # Layer pattern: MMM*MMM*MMM*MMM* (12 Mamba + 4 attention layers)
 #   M = Mamba (state-space) layer
 #   * = multi-head attention layer
 #
-# Data modes:
-#   USE_MOCK_DATA=true (default) — synthetic data, no setup.
-#   USE_MOCK_DATA=false — Common Pile CI dataset (12 M sequences / ~12.7 B
-#       tokens, GPT-2 BPE). Same dataset as Megatron-LM functional tests.
+# Data: Common Pile CI dataset (12 M sequences / ~12.7 B tokens, GPT-2 BPE).
+#   Same dataset as Megatron-LM functional tests; no extra setup needed.
 #
-# Runtime: ≈2 min on 1 H100 (mock data).
+# Runtime: ≈20 min on 4 H100s (8000 samples, 2000 steps).
 
 # ---------------------------------------------------------------------------
 # SLURM batch directives — read by sbatch; treated as comments otherwise.
@@ -31,7 +29,7 @@
 #SBATCH -p interactive
 #SBATCH --account=nemotron_sw_pre
 #SBATCH --nodes=1
-#SBATCH -t 0:30:00
+#SBATCH -t 1:00:00
 #SBATCH --mem=0
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
@@ -89,32 +87,25 @@ if [ "${GPUS_PER_NODE}" -eq 0 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Data
-# ---------------------------------------------------------------------------
-USE_MOCK_DATA="${USE_MOCK_DATA:-true}"
-
-# Common Pile v0.1, GPT-2 BPE tokenized. 12 M sequences / ~12.7 B tokens.
-# Already preprocessed — the same dataset used by all functional tests.
+# Data — Common Pile v0.1, GPT-2 BPE tokenized.
+# 12 M sequences / ~12.7 B tokens; already preprocessed.
 # Canonical path on this cluster (mapped to /mnt/artifacts inside CI containers).
+# ---------------------------------------------------------------------------
 CI_DATA_ROOT="/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_mcore/mcore_ci"
 DATA_PATH="${CI_DATA_ROOT}/text/common_pile/v01_filtered_data/my-gpt3_00_text_document"
 GPT2_VOCAB="${CI_DATA_ROOT}/text/common_pile/v01_filtered_data/bpe/vocab.json"
 GPT2_MERGES="${CI_DATA_ROOT}/text/common_pile/v01_filtered_data/bpe/merges.txt"
 
-if [ "${USE_MOCK_DATA}" = "true" ]; then
-    data_options="--mock-data"
-else
-    data_options=" \
-        --data-path ${DATA_PATH} \
-        --split 949,50,1 \
-        --data-cache-path ${DATACACHE_DIR} \
-        --tokenizer-type GPT2BPETokenizer \
-        --vocab-file ${GPT2_VOCAB} \
-        --merge-file ${GPT2_MERGES} \
-        --no-mmap-bin-files \
-        --num-workers 2 \
-        --no-create-attention-mask-in-dataloader "
-fi
+data_options=" \
+    --data-path ${DATA_PATH} \
+    --split 949,50,1 \
+    --data-cache-path ${DATACACHE_DIR} \
+    --tokenizer-type GPT2BPETokenizer \
+    --vocab-file ${GPT2_VOCAB} \
+    --merge-file ${GPT2_MERGES} \
+    --no-mmap-bin-files \
+    --num-workers 2 \
+    --no-create-attention-mask-in-dataloader "
 
 # ---------------------------------------------------------------------------
 # W&B logging
@@ -156,12 +147,12 @@ options=" \
     --bf16 \
     --seq-length 4096 \
     --max-position-embeddings 4096 \
-    --train-samples 100 \
+    --train-samples 8000 \
     --lr-decay-style WSD \
-    --lr-decay-samples 100 \
-    --lr-warmup-samples 5 \
+    --lr-decay-samples 8000 \
+    --lr-warmup-samples 400 \
     --lr-wsd-decay-style minus_sqrt \
-    --lr-wsd-decay-samples 20 \
+    --lr-wsd-decay-samples 1600 \
     --micro-batch-size 1 \
     --global-batch-size ${GPUS_PER_NODE} \
     --lr 8e-4 \
@@ -170,7 +161,7 @@ options=" \
     --clip-grad 1.0 \
     --adam-beta1 0.9 \
     --adam-beta2 0.95 \
-    --eval-interval 50 \
+    --eval-interval 400 \
     --eval-iters 5 \
     \
     ${data_options} \
@@ -186,7 +177,7 @@ options=" \
     --ckpt-format torch_dist \
     --load ${CHECKPOINT_DIR} \
     --save ${CHECKPOINT_DIR} \
-    --save-interval 100 \
+    --save-interval 1000 \
     \
     --log-interval 5 \
     --log-params-norm \
@@ -197,7 +188,7 @@ options=" \
     ${wandb_options} \
     \
     --distributed-timeout-minutes 10 \
-    --exit-duration-in-mins 25 \
+    --exit-duration-in-mins 55 \
     --disable-gloo-process-groups "
 
 # ---------------------------------------------------------------------------
