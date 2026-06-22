@@ -117,16 +117,15 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# W&B logging — uncomment and fill in to enable.
+# W&B logging
 # Requires wandb login (or WANDB_API_KEY set) inside the container.
 # ---------------------------------------------------------------------------
-# WANDB_PROJECT="megatron-tutorial"
-# WANDB_EXP_NAME="${NAME}_${DATETIME}"
-# wandb_options=" \
-#     --wandb-project ${WANDB_PROJECT} \
-#     --wandb-exp-name ${WANDB_EXP_NAME} \
-#     --wandb-save-dir ${RUN_DIR}/wandb "
-wandb_options=""
+WANDB_PROJECT="megatron-anthomas"
+WANDB_EXP_NAME="${NAME}_${DATETIME}"
+wandb_options=" \
+     --wandb-project ${WANDB_PROJECT} \
+     --wandb-exp-name ${WANDB_EXP_NAME} \
+     --wandb-save-dir ${RUN_DIR}/wandb "
 
 # ---------------------------------------------------------------------------
 # Model and training options
@@ -207,7 +206,7 @@ options=" \
 echo "Launching ${GPUS_PER_NODE}-GPU training."
 echo "Checkpoints: ${CHECKPOINT_DIR}"
 
-torchrun \
+uv --project "${REPO_DIR}" run python -m torch.distributed.run \
     --standalone \
     --nnodes=1 \
     --nproc-per-node="${GPUS_PER_NODE}" \
