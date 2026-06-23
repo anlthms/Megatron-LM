@@ -6,7 +6,7 @@
 #   Batch (submit from login node):
 #     sbatch examples/training_scripts/train_hybrid.sh
 #
-#   Interactive (get a shell first, then run):
+#   Interactive (get a shell first, then run the training script):
 #     bash examples/training_scripts/start_interactive_node.sh
 #     bash examples/training_scripts/train_hybrid.sh
 #
@@ -26,7 +26,7 @@
 # ---------------------------------------------------------------------------
 # SLURM batch directives — read by sbatch; treated as comments otherwise.
 # ---------------------------------------------------------------------------
-#SBATCH -p interactive
+#SBATCH -p batch
 #SBATCH --account=nemotron_sw_pre
 #SBATCH --nodes=1
 #SBATCH -t 1:00:00
@@ -64,6 +64,7 @@ if [ -z "${ROOT_DIR:-}" ]; then
     ROOT_DIR="/lustre/fsw/portfolios/nemotron/projects/nemotron_sw_pre/users/${SLURM_JOB_USER}"
 fi
 REPO_DIR="${ROOT_DIR}/megatron-lm"
+IMAGE_PATH="${ROOT_DIR}/images/mcore_ci_lts.sqsh"
 
 NAME="train_hybrid"
 DATETIME=$(date +'date_%y-%m-%d_time_%H-%M-%S')
@@ -193,7 +194,23 @@ options=" \
 
 # ---------------------------------------------------------------------------
 # Launch
+#
+# If INSIDE_CONTAINER is not set, spin up the container via srun and re-invoke
+# this script inside it.  start_interactive_node.sh sets INSIDE_CONTAINER=1
+# so interactive sessions skip this step.
 # ---------------------------------------------------------------------------
+SCRIPT_ABS="${REPO_DIR}/examples/training_scripts/train_hybrid.sh"
+
+if [ -z "${INSIDE_CONTAINER:-}" ]; then
+    exec srun -l \
+        --ntasks=1 \
+        --container-image "${IMAGE_PATH}" \
+        --container-mounts "/lustre:/lustre,${HOME}:${HOME}" \
+        --no-container-mount-home \
+        --output="${LOGS_DIR}/%x_%j_${DATETIME}.log" \
+        sh -c "INSIDE_CONTAINER=1 ROOT_DIR='${ROOT_DIR}' HOME='${HOME}' bash ${SCRIPT_ABS}"
+fi
+
 echo "Launching ${GPUS_PER_NODE}-GPU training."
 echo "Checkpoints: ${CHECKPOINT_DIR}"
 
