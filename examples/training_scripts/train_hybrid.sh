@@ -21,7 +21,7 @@
 # Data: Common Pile CI dataset (12 M sequences / ~12.7 B tokens, GPT-2 BPE).
 #   Same dataset as Megatron-LM functional tests; no extra setup needed.
 #
-# Runtime: ≈20 min on 4 H100s (8000 samples, 2000 steps).
+# Runtime: ≈5 min on 8 H100s (8000 samples, 1000 steps).
 
 # ---------------------------------------------------------------------------
 # SLURM batch directives — read by sbatch; treated as comments otherwise.
@@ -32,7 +32,7 @@
 #SBATCH -t 1:00:00
 #SBATCH --mem=0
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=4
+#SBATCH --gpus-per-node=8
 #SBATCH --dependency=singleton
 #SBATCH --job-name=train_hybrid
 
