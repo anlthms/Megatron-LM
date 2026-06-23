@@ -39,6 +39,17 @@
 set -eu
 
 # ---------------------------------------------------------------------------
+# GPU count — must be non-zero; fail fast before any other setup.
+# ---------------------------------------------------------------------------
+GPUS_PER_NODE=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)
+if [ "${GPUS_PER_NODE}" -eq 0 ]; then
+    echo "Error: no GPUs detected. Run this script inside a container on a compute node."
+    echo "  Batch:       sbatch examples/training_scripts/train_hybrid.sh"
+    echo "  Interactive: bash examples/training_scripts/start_interactive_node.sh"
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
 # Environment
 # ---------------------------------------------------------------------------
 export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -77,17 +88,6 @@ TENSORBOARD_DIR="${RUN_DIR}/tensorboard"
 mkdir -p "${LOGS_DIR}" "${CHECKPOINT_DIR}" "${DATACACHE_DIR}" "${TENSORBOARD_DIR}"
 
 # ---------------------------------------------------------------------------
-# GPU count — must be non-zero; script errors out otherwise.
-# ---------------------------------------------------------------------------
-GPUS_PER_NODE=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)
-if [ "${GPUS_PER_NODE}" -eq 0 ]; then
-    echo "Error: no GPUs detected. Run this script inside a container on a compute node." >&2
-    echo "  Batch:       sbatch examples/training_scripts/train_hybrid.sh" >&2
-    echo "  Interactive: bash examples/training_scripts/start_interactive_node.sh" >&2
-    exit 1
-fi
-
-# ---------------------------------------------------------------------------
 # Data — Common Pile v0.1, GPT-2 BPE tokenized.
 # 12 M sequences / ~12.7 B tokens; already preprocessed.
 # Canonical path on this cluster (mapped to /mnt/artifacts inside CI containers).
@@ -112,7 +112,7 @@ data_options=" \
 # W&B logging
 # Requires wandb login (or WANDB_API_KEY set) inside the container.
 # ---------------------------------------------------------------------------
-WANDB_PROJECT="megatron-anthomas"
+WANDB_PROJECT="megatron-$(basename "${ROOT_DIR}")"
 WANDB_EXP_NAME="${NAME}_${DATETIME}"
 wandb_options=" \
      --wandb-project ${WANDB_PROJECT} \
