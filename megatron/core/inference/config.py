@@ -54,7 +54,10 @@ class MambaInferenceStateConfig:
 
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_type_list = getattr(decoder, "layer_type_list", None)
-        if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
+        has_ssm = layer_type_list is not None and (
+            Symbols.MAMBA in layer_type_list or Symbols.GDN in layer_type_list
+        )
+        if has_ssm:
             (mamba_conv_states_shape, mamba_ssm_states_shape) = (
                 decoder.mamba_state_shapes_per_request()
             )
@@ -66,6 +69,9 @@ class MambaInferenceStateConfig:
             for layer_type, layer in zip(decoder.layer_type_list, decoder.layers):
                 if layer_type == Symbols.MAMBA and hasattr(layer, 'mixer'):
                     mamba_chunk_size = layer.mixer.chunk_size
+                    break
+                if layer_type == Symbols.GDN and hasattr(layer, 'self_attention'):
+                    mamba_chunk_size = layer.self_attention.chunk_size
                     break
             return cls(
                 layer_type_list=layer_type_list,
