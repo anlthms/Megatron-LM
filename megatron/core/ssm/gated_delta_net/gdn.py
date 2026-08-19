@@ -26,15 +26,16 @@ from megatron.core.ssm.gated_delta_net.common import (
     get_parameter_local_cp,
     l2norm,
 )
+from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
 try:
-    from fla.modules.convolution import causal_conv1d_update
-    from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
+    from megatron.core.ssm.ops.common.gated_delta_rule_triton import (
+        indexed_recurrent_gated_delta_rule,
+    )
 except ImportError:
-    causal_conv1d_update = None
-    fused_recurrent_gated_delta_rule = None
+    indexed_recurrent_gated_delta_rule = None
 
 
 class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
@@ -334,36 +335,30 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         assert (
             intermediate_conv_state is None and intermediate_ssm_state is None
         ), "GDN speculative decoding state capture is not supported."
-        assert causal_conv1d_update is not None and fused_recurrent_gated_delta_rule is not None
+        assert indexed_recurrent_gated_delta_rule is not None
 
         qkv, gate, beta, alpha = self._split_projection(projected, batch, seq_len)
-        read_indices = batch_indices.clamp(min=0)
 
-        active_conv_state = conv_state[read_indices].contiguous()
         qkv_dtype = qkv.dtype
-        qkv, active_conv_state = causal_conv1d_update(
+        qkv = causal_conv1d_update(
             x=qkv.to(conv_state.dtype),
-            cache=active_conv_state,
+            conv_state=conv_state,
             weight=self.conv1d.weight.squeeze(1).to(conv_state.dtype),
             bias=self.conv1d.bias.to(conv_state.dtype) if self.conv1d.bias is not None else None,
-            activation=self.activation,
+            silu_activation=self.activation,
+            conv_state_indices=batch_indices,
         )
         qkv = qkv.to(qkv_dtype)
-        tensor_masked_update(conv_state, batch_indices, active_conv_state)
 
         kernel_inputs = self._prepare_inference_inputs(qkv, beta, alpha, batch, seq_len)
-        active_ssm_state = ssm_state[read_indices].contiguous()
-        core_attn_out, final_ssm_state = fused_recurrent_gated_delta_rule(
+        core_attn_out = indexed_recurrent_gated_delta_rule(
             **kernel_inputs,
-            A_log=self.A_log,
+            a_log=self.A_log,
             dt_bias=self.dt_bias,
-            initial_state=active_ssm_state,
-            output_final_state=True,
-            use_qk_l2norm_in_kernel=self.use_qk_l2norm,
-            use_gate_in_kernel=True,
-            use_beta_sigmoid_in_kernel=True,
+            state=ssm_state,
+            state_indices=batch_indices,
+            use_qk_l2norm=self.use_qk_l2norm,
         )
-        tensor_masked_update(ssm_state, batch_indices, final_ssm_state)
         return self._apply_gated_norm(core_attn_out, gate).reshape(batch, seq_len, -1)
 
     def ssm_prefill(
