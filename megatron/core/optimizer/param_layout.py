@@ -42,6 +42,54 @@ def pad_bucket_end(
     )
 
 
+def layout_group_key(param: torch.nn.Parameter):
+    """Return the contiguous-layout group key of ``param``, or None when ungrouped.
+
+    Modules that consume several parameters as one fused tensor (e.g. grouped
+    expert weights read as a single ``[num_experts, out, in]`` view by inference
+    kernels) tag each member with ``_contiguous_layout_group = (group_key,
+    member_index, group_size)``. The layout keeps such a group adjacent,
+    ascending, and unpadded inside one bucket so the fused view can alias the
+    buffer storage directly instead of maintaining a second copy.
+    """
+    group = getattr(param, "_contiguous_layout_group", None)
+    return None if group is None else group[0]
+
+
+def order_params_for_layout(params: List[torch.nn.Parameter]) -> List[torch.nn.Parameter]:
+    """Return ``params`` in buffer packing order.
+
+    The packing order is the global reverse of registration order (approximating
+    backprop order for bucket dispatch), except that members of one
+    contiguous-layout group are restored to ascending member order: the global
+    reversal would otherwise place ``weightN`` before ``weight0`` and make a
+    zero-copy fused view over the group impossible.
+    """
+    reversed_params = list(params)[::-1]
+    ordered: List[torch.nn.Parameter] = []
+    index = 0
+    while index < len(reversed_params):
+        group = layout_group_key(reversed_params[index])
+        if group is None:
+            ordered.append(reversed_params[index])
+            index += 1
+            continue
+        run_end = index
+        while (
+            run_end < len(reversed_params)
+            and layout_group_key(reversed_params[run_end]) == group
+        ):
+            run_end += 1
+        ordered.extend(
+            sorted(
+                reversed_params[index:run_end],
+                key=lambda p: p._contiguous_layout_group[1],
+            )
+        )
+        index = run_end
+    return ordered
+
+
 @dataclass(frozen=True)
 class BufferKey:
     """Identifies a distinct parameter buffer.

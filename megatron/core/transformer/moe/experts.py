@@ -1021,6 +1021,18 @@ class InferenceGroupedMLP(TEGroupedMLP):
         # checkpoint loading has already populated the per-expert parameters.
         self._concatenated_weights_built = False
 
+        # Tag each grouped weight so the DDP buffer lays the group out
+        # adjacent, ascending, and unpadded inside one bucket (see
+        # megatron.core.optimizer.param_layout.order_params_for_layout).
+        # _build_concatenated_weights can then view the buffer storage directly
+        # instead of copying into a second allocation that optimizer updates
+        # would no longer reach.
+        for linear in (self.linear_fc1, self.linear_fc2):
+            for i in range(self.num_local_experts):
+                weight = getattr(linear, f'weight{i}', None)
+                if isinstance(weight, torch.nn.Parameter):
+                    weight._contiguous_layout_group = (id(linear), i, self.num_local_experts)
+
         if HAVE_FLASHINFER:
             self._flashinfer_activation_type = self._resolve_flashinfer_activation_type()
 
@@ -1104,21 +1116,74 @@ class InferenceGroupedMLP(TEGroupedMLP):
                     w.data.data = stacked_data[i]
                     w.data.scale = stacked_scale[i]
 
+    def _stacked_view_over_group(self, linear) -> Optional[torch.Tensor]:
+        """Return a ``[num_experts, out, in]`` view over the group's shared storage.
+
+        Returns None unless every ``weight{i}`` of ``linear`` lives adjacent and
+        ascending in one storage (the layout arranged by
+        ``order_params_for_layout`` when DDP owns the parameters). The returned
+        tensor aliases that storage: optimizer updates and parameter
+        all-gathers are visible to inference with no copy, and its address is
+        stable for CUDA graph capture because the buffer is allocated once.
+        """
+        params = [getattr(linear, f'weight{i}') for i in range(self.num_local_experts)]
+        first = params[0].data
+        storage = first.untyped_storage()
+        member_numel = first.numel()
+        base_offset = first.storage_offset()
+        for i, param in enumerate(params):
+            data = param.data
+            if (
+                data.dtype != first.dtype
+                or data.shape != first.shape
+                or not data.is_contiguous()
+                or data.untyped_storage().data_ptr() != storage.data_ptr()
+                or data.storage_offset() != base_offset + i * member_numel
+            ):
+                return None
+        return torch.empty(0, dtype=first.dtype, device=first.device).set_(
+            storage, base_offset, (self.num_local_experts, *first.shape)
+        )
+
     @torch.inference_mode(False)  # needed for non-colocated inference.
     def _build_concatenated_weights(self):
         """Create big contiguous weight tensors that share storage with TE's per-expert parameters.
 
-        Creates _fc1_weight and _fc2_weight as contiguous tensors of shape
-        [num_experts, out_features, in_features]. Instead of replacing TE's parameters
-        (which breaks TE's internal bookkeeping), we redirect each parameter's .data
-        to be a view into the contiguous buffer. The nn.Parameter objects themselves
-        remain untouched in TE's module, preserving FP8 scaling state, etc.
+        Preferred path: when the DDP buffer already holds each group's weights
+        adjacent and ascending (arranged via the ``_contiguous_layout_group``
+        tags set in ``__init__``), ``_fc1_weight`` / ``_fc2_weight`` are plain
+        views over that storage — zero copies, and a single storage shared by
+        training, the distributed optimizer's updates/gathers, and inference.
 
-        This allows:
-        - TE's forward to work correctly (same Parameter objects, same internal state)
-        - Training updates to flow through (param.data is a view into the big tensor)
-        - torch.nn.functional.grouped_mm / FlashInfer to use the big tensor directly
+        Fallback (no DDP, or a layout that could not honor the grouping):
+        allocate contiguous tensors of shape [num_experts, out, in], copy the
+        weights in, and redirect each parameter's ``.data`` to a view of the
+        allocation. Instead of replacing TE's parameters (which breaks TE's
+        internal bookkeeping), only ``.data`` is redirected — the nn.Parameter
+        objects remain untouched in TE's module, preserving FP8 scaling state.
+        NOTE: after DDP construction this fallback detaches the parameters from
+        the DDP buffer, so optimizer updates stop reaching the serving tensors;
+        it is only correct without DDP (e.g. dedicated inference models).
+
+        Either way:
+        - TE's forward works correctly (same Parameter objects, same state)
+        - torch.nn.functional.grouped_mm / FlashInfer use the big tensor directly
         """
+        _fc1_weight = self._stacked_view_over_group(self.linear_fc1)
+        _fc2_weight = self._stacked_view_over_group(self.linear_fc2)
+        if _fc1_weight is not None and _fc2_weight is not None:
+            logger.info(
+                "InferenceGroupedMLP: serving expert weights as zero-copy views "
+                "into the parameter buffer."
+            )
+            self.register_buffer('_fc1_weight', _fc1_weight, persistent=False)
+            self.register_buffer('_fc2_weight', _fc2_weight, persistent=False)
+            return
+
+        logger.info(
+            "InferenceGroupedMLP: expert weights are not adjacent in one storage; "
+            "falling back to copied concatenated weights (correct only without DDP)."
+        )
         # Get device/dtype from existing TE weights
         device = self.linear_fc1.weight0.device
         dtype = self.linear_fc1.weight0.dtype

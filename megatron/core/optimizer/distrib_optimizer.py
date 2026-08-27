@@ -70,7 +70,14 @@ from .optimizer import (
     param_group_identifier_keys,
 )
 from .optimizer_config import OptimizerConfig
-from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end, pad_param_start
+from .param_layout import (
+    FullParamLayout,
+    PerBufferParamLayout,
+    layout_group_key,
+    order_params_for_layout,
+    pad_bucket_end,
+    pad_param_start,
+)
 
 logger = getLogger(__name__)
 
@@ -549,8 +556,23 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             bucket_indices.append((bucket_start_index, bucket_end_index))
             return bucket_end_index, bucket_id + 1
 
-        for param in params[::-1]:
-            param_start_index = pad_param_start(param_start_index)
+        ordered_params = order_params_for_layout(params)
+        for position, param in enumerate(ordered_params):
+            # Contiguous-layout groups stay adjacent (no start padding after the
+            # first member) and unsplit (no bucket close before the last member)
+            # so a fused view over the group can alias the buffer directly.
+            grouped_with_previous = (
+                position > 0
+                and layout_group_key(param) is not None
+                and layout_group_key(param) == layout_group_key(ordered_params[position - 1])
+            )
+            grouped_with_next = (
+                position + 1 < len(ordered_params)
+                and layout_group_key(param) is not None
+                and layout_group_key(param) == layout_group_key(ordered_params[position + 1])
+            )
+            if not grouped_with_previous:
+                param_start_index = pad_param_start(param_start_index)
 
             # Split shared embedding params into separate bucket.
             if _does_param_require_new_bucket(param) and len(bucket_params) > 0:
@@ -565,9 +587,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             param_index_map[param] = (param_start_index, param_end_index, bucket_id)
             bucket_params.add(param)
 
-            if (
-                bucket_size is not None and (param_end_index - bucket_start_index) >= bucket_size
-            ) or _does_param_require_new_bucket(param):
+            if not grouped_with_next and (
+                (
+                    bucket_size is not None
+                    and (param_end_index - bucket_start_index) >= bucket_size
+                )
+                or _does_param_require_new_bucket(param)
+            ):
                 bucket_start_index, bucket_id = _finalize_bucket(
                     param_end_index, bucket_start_index, bucket_id
                 )

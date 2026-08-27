@@ -966,7 +966,11 @@ def _compute_default_per_buffer_param_layout(
     Returns:
         PerBufferParamLayout with the computed mapping.
     """
-    from ..optimizer.param_layout import PerBufferParamLayout
+    from ..optimizer.param_layout import (
+        PerBufferParamLayout,
+        layout_group_key,
+        order_params_for_layout,
+    )
 
     param_index_map = {}
     bucket_indices = []
@@ -977,13 +981,25 @@ def _compute_default_per_buffer_param_layout(
     bucket_params = set()
     bucket_id = 0
 
-    for param in params[::-1]:
+    ordered_params = order_params_for_layout(params)
+    for position, param in enumerate(ordered_params):
+        # Keep contiguous-layout groups inside one bucket (see
+        # order_params_for_layout); with no padding here, adjacency is automatic.
+        grouped_with_next = (
+            position + 1 < len(ordered_params)
+            and layout_group_key(param) is not None
+            and layout_group_key(param) == layout_group_key(ordered_params[position + 1])
+        )
         this_numel = param.data.nelement()
         param_end_index = param_start_index + this_numel
         param_index_map[param] = (param_start_index, param_end_index, bucket_id)
         bucket_params.add(param)
 
-        if bucket_size is not None and (param_end_index - bucket_start_index) >= bucket_size:
+        if (
+            not grouped_with_next
+            and bucket_size is not None
+            and (param_end_index - bucket_start_index) >= bucket_size
+        ):
             per_bucket_numel_unpadded.append(param_end_index - bucket_start_index)
             bucket_indices.append((bucket_start_index, param_end_index))
             bucket_start_index = param_end_index
