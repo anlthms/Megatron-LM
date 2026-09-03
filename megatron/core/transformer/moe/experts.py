@@ -1303,48 +1303,95 @@ class InferenceGroupedMLP(TEGroupedMLP):
         return True
 
     @torch.inference_mode(False)  # needed for non-colocated inference.
+    @torch.no_grad()
     def _build_concatenated_weights(self):
-        """Create big contiguous weight tensors that share storage with TE's per-expert parameters.
+        """Expose contiguous expert weights without replacing TE's parameters.
 
-        Creates _fc1_weight and _fc2_weight as contiguous tensors of shape
-        [num_experts, out_features, in_features]. Instead of replacing TE's parameters
-        (which breaks TE's internal bookkeeping), we redirect each parameter's .data
-        to be a view into the contiguous buffer. The nn.Parameter objects themselves
-        remain untouched in TE's module, preserving FP8 scaling state, etc.
+        For high-precision weights, TE's single grouped parameter is the canonical contiguous
+        storage. This method runs after checkpoint loading and distributed wrapping, so its
+        ``rowwise_data`` points at the live optimizer/DDP buffer. The serving tensors are merely
+        ``[expert, out, in]`` views of that storage.
 
-        This allows:
-        - TE's forward to work correctly (same Parameter objects, same internal state)
-        - Training updates to flow through (param.data is a view into the big tensor)
-        - torch.nn.functional.grouped_mm / FlashInfer to use the big tensor directly
+        Quantized modes for which TE does not support a single grouped parameter retain the
+        existing compatibility path: copy the discrete weights into contiguous serving buffers,
+        then redirect each parameter's data to its corresponding view. Keeping the Parameter
+        objects intact preserves TE's bookkeeping and quantization state.
         """
-        # Get device/dtype from existing TE weights
+        fc1_is_grouped = getattr(self.linear_fc1, 'single_grouped_weight', False)
+        fc2_is_grouped = getattr(self.linear_fc2, 'single_grouped_weight', False)
+        if fc1_is_grouped != fc2_is_grouped:
+            raise RuntimeError("FC1 and FC2 must use the same expert-weight parameter layout.")
+        if fc1_is_grouped:
+            # TE already owns the canonical grouped storage; expose serving views without copying
+            # values or repointing Parameter objects.
+            self.register_buffer(
+                '_fc1_weight', self._view_native_grouped_weight(self.linear_fc1), persistent=False
+            )
+            self.register_buffer(
+                '_fc2_weight', self._view_native_grouped_weight(self.linear_fc2), persistent=False
+            )
+            return
+
+        if not (self.config.fp8 or self.config.fp4):
+            raise RuntimeError(
+                "InferenceGroupedMLP requires Transformer Engine to honor "
+                "moe_single_grouped_weight=True for high-precision expert weights."
+            )
+
+        # Quantized configurations whose primary parameters cannot use TE's native grouped
+        # representation retain the pre-existing inference layout conversion.
+        # Get the device, dtype, and per-expert matrix shapes from the existing TE weights.
         device = self.linear_fc1.weight0.device
         dtype = self.linear_fc1.weight0.dtype
-
         fc1_shape = self.linear_fc1.weight0.shape  # [out_features, in_features]
-        fc2_shape = self.linear_fc2.weight0.shape
+        fc2_shape = self.linear_fc2.weight0.shape  # [out_features, in_features]
 
-        # Create big contiguous tensors
+        # Allocate serving tensors as contiguous [expert, out, in] arrays.
         _fc1_weight = torch.empty(self.num_local_experts, *fc1_shape, device=device, dtype=dtype)
         _fc2_weight = torch.empty(self.num_local_experts, *fc2_shape, device=device, dtype=dtype)
 
-        # Copy existing TE weights into big tensors, then point param.data to the views
+        # Copy the initialized values before redirecting Parameter.data into the serving storage.
         for i in range(self.num_local_experts):
             fc1_param = getattr(self.linear_fc1, f'weight{i}')
             fc2_param = getattr(self.linear_fc2, f'weight{i}')
-
-            # Copy initialized data into contiguous buffer
             _fc1_weight[i].copy_(fc1_param.data)
             _fc2_weight[i].copy_(fc2_param.data)
-
-            # Redirect param.data to view into contiguous buffer.
-            # The nn.Parameter object stays the same — TE's internal state is preserved.
+            # The Parameter objects remain unchanged, preserving TE's internal state.
             fc1_param.data = _fc1_weight[i]
             fc2_param.data = _fc2_weight[i]
 
-        # Register big tensors as non-persistent buffers (for .to() device movement, not saved)
+        # These buffers participate in device movement but are derived and not checkpointed.
         self.register_buffer('_fc1_weight', _fc1_weight, persistent=False)
         self.register_buffer('_fc2_weight', _fc2_weight, persistent=False)
+
+    def _view_native_grouped_weight(self, linear: torch.nn.Module) -> torch.Tensor:
+        """Return an ``[expert, out, in]`` view of a TE single grouped parameter.
+
+        Detaching suppresses autograd tracking for the inference view without breaking its storage
+        alias to the trainable parameter.
+        """
+        if not getattr(linear, 'single_grouped_weight', False):
+            raise RuntimeError(
+                "InferenceGroupedMLP requires Transformer Engine to honor "
+                "moe_single_grouped_weight=True for high-precision expert weights."
+            )
+
+        weight = linear.get_parameter('weight')
+        rowwise_data = getattr(weight, 'rowwise_data', None)
+        if not isinstance(rowwise_data, torch.Tensor) or not rowwise_data.is_contiguous():
+            raise RuntimeError(
+                "Transformer Engine's grouped expert parameter has no contiguous rowwise_data."
+            )
+
+        expected_shape = (self.num_local_experts, linear.out_features, linear.in_features)
+        expected_numel = expected_shape[0] * expected_shape[1] * expected_shape[2]
+        if rowwise_data.numel() != expected_numel:
+            raise RuntimeError(
+                "Unexpected Transformer Engine grouped weight size: "
+                f"expected {expected_numel} elements for shape {expected_shape}, "
+                f"got {rowwise_data.numel()}."
+            )
+        return rowwise_data.detach().view(expected_shape)
 
     def _flashinfer_forward(self, hidden_states, routing_map, probs):
         """FlashInfer fused MoE kernel for CUDA-graphed inference iterations."""
@@ -1452,13 +1499,16 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         # Lazily build concatenated weights on first forward (after checkpoint load)
         if not self._concatenated_weights_built:
-            w = self.linear_fc1.weight0
-            if isinstance(w, MXFP8Tensor) or (
-                hasattr(w, 'data') and isinstance(w.data, MXFP8Tensor)
-            ):
-                self._build_concatenated_mxfp8_weights()
-            else:
+            if getattr(self.linear_fc1, 'single_grouped_weight', False):
                 self._build_concatenated_weights()
+            else:
+                w = self.linear_fc1.weight0
+                if isinstance(w, MXFP8Tensor) or (
+                    hasattr(w, 'data') and isinstance(w.data, MXFP8Tensor)
+                ):
+                    self._build_concatenated_mxfp8_weights()
+                else:
+                    self._build_concatenated_weights()
             self._concatenated_weights_built = True
 
         if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:

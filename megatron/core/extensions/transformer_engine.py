@@ -2534,6 +2534,13 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     "that exposes the use_grouped_tensor argument."
                 )
 
+            if extra_kwargs.get("single_grouped_weight") or extra_kwargs.get("single_grouped_bias"):
+                # MCore's config is the public source of truth for the parameter layout. TE still
+                # guards its native single-parameter implementation with this compatibility env
+                # switch, so enable it before constructing GroupedLinear rather than requiring
+                # every launcher to know about a TE implementation detail.
+                os.environ["NVTE_GROUPED_LINEAR_SINGLE_PARAM"] = "1"
+
             self.te_quant_params: Optional[TEQuantizationParams] = None
             quant_config = get_quant_config_or_none(name, config.quant_recipe)
             self.finish_init(quant_config)

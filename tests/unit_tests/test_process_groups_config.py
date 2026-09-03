@@ -1,5 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+from copy import deepcopy
+
 import pytest
 import torch.distributed as dist
 
@@ -103,6 +105,12 @@ class TestProcessGroupsConfig:
         repr_str = repr(model_pgs)
         assert "ProcessGroupCollection(" in repr_str
         assert "hcp([2, 4])" in repr_str
+
+    def test_deepcopy_preserves_process_group_collection_identity(self, mocker):
+        """Process groups are live resources and must remain shared across config copies."""
+        model_pgs = ProcessGroupCollection(tp=mocker.Mock(spec=dist.ProcessGroup))
+
+        assert deepcopy(model_pgs) is model_pgs
 
 
 class TestPGConfigDefaultInitialization:

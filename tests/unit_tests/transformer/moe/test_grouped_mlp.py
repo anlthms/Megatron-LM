@@ -16,7 +16,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.transformer.module import Float16Module
-from megatron.core.transformer.moe.experts import TEGroupedMLP
+from megatron.core.transformer.moe.experts import InferenceGroupedMLP, TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -42,6 +42,63 @@ def test_op_fuser_transformer_config_args_are_exposed():
     assert args.use_transformer_engine_op_fuser is True
     assert args.moe_mlp_glu_interleave_size == 16
     assert args.moe_use_grouped_tensor is True
+
+
+def test_inference_grouped_mlp_enables_native_grouped_storage_for_high_precision():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_ffn_hidden_size=128,
+        moe_router_dtype="fp32",
+        moe_grouped_gemm=False,
+        transformer_impl="inference_optimized",
+        normalization="RMSNorm",
+        add_bias_linear=False,
+    )
+
+    assert config.moe_grouped_gemm is True
+    assert config.moe_use_grouped_tensor is False
+    assert config.moe_single_grouped_weight is True
+
+
+def _make_inference_grouped_mlp_with_native_weights():
+    module = InferenceGroupedMLP.__new__(InferenceGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module.num_local_experts = 3
+
+    for linear_name, out_features, in_features in (('linear_fc1', 2, 4), ('linear_fc2', 4, 2)):
+        linear = torch.nn.Module()
+        linear.single_grouped_weight = True
+        linear.out_features = out_features
+        linear.in_features = in_features
+        grouped_data = torch.arange(
+            module.num_local_experts * out_features * in_features, dtype=torch.float32
+        ).view(module.num_local_experts, out_features, in_features)
+        weight = torch.nn.Parameter(grouped_data)
+        weight.rowwise_data = weight.data
+        linear.register_parameter('weight', weight)
+        setattr(module, linear_name, linear)
+
+    return module
+
+
+def test_inference_grouped_mlp_serving_views_alias_native_grouped_parameters():
+    module = _make_inference_grouped_mlp_with_native_weights()
+    replacement_fc1_storage = torch.full_like(module.linear_fc1.weight.rowwise_data, 7)
+    module.linear_fc1.weight.rowwise_data = replacement_fc1_storage
+
+    module._build_concatenated_weights()
+
+    assert module._fc1_weight.shape == (module.num_local_experts, 2, 4)
+    assert module._fc2_weight.shape == (module.num_local_experts, 4, 2)
+    assert module._fc1_weight.data_ptr() == replacement_fc1_storage.data_ptr()
+    assert module._fc2_weight.data_ptr() == module.linear_fc2.weight.rowwise_data.data_ptr()
+    assert "_fc1_weight" not in module.state_dict()
+    assert "_fc2_weight" not in module.state_dict()
+    replacement_fc1_storage[1].add_(5)
+    torch.testing.assert_close(module._fc1_weight[1], replacement_fc1_storage[1])
 
 
 def test_op_fuser_enables_grouped_tensor():

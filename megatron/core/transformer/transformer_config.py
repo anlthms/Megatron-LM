@@ -888,8 +888,10 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_single_grouped_weight: bool = False
     """When using TE GroupedLinear for MoE experts, store expert weights as a single grouped
-    parameter via Transformer Engine's `GroupedTensor`. Requires ``moe_grouped_gemm=True`` and
-    ``moe_use_grouped_tensor=True``.
+    parameter via Transformer Engine's `GroupedTensor`. Requires ``moe_grouped_gemm=True``.
+    High-precision inference-optimized MoE enables this option automatically so training and
+    serving share one expert-weight allocation. This parameter layout is independent of whether
+    activations use the ``moe_use_grouped_tensor`` execution path.
     """
 
     moe_single_grouped_bias: bool = False
@@ -1535,6 +1537,19 @@ class TransformerConfig(ModelParallelConfig):
                 self.experimental_attention_variant
             )
 
+        # The inference backend always executes experts as a grouped MLP. For high-precision
+        # weights, make TE's native grouped parameter the canonical storage from module
+        # construction so training and serving share one optimizer-owned allocation. Keep
+        # quantized modes on their existing derived-weight paths.
+        if (
+            self.transformer_impl == "inference_optimized"
+            and self.num_moe_experts is not None
+            and not self.fp8
+            and not self.fp4
+        ):
+            self.moe_grouped_gemm = True
+            self.moe_single_grouped_weight = True
+
         if self.use_transformer_engine_op_fuser and self.moe_grouped_gemm:
             self.moe_use_grouped_tensor = True
 
@@ -1884,8 +1899,6 @@ class TransformerConfig(ModelParallelConfig):
                     "(--fp4-param-gather). Without FP4 parameter gather, Transformer Engine "
                     "uses a split-quantize fallback that is being deprecated."
                 )
-            if not self.moe_use_grouped_tensor:
-                raise ValueError("moe_single_grouped_weight requires moe_use_grouped_tensor=True.")
         if self.moe_single_grouped_bias and not self.add_bias_linear:
             raise ValueError("moe_single_grouped_bias requires add_bias_linear=True.")
         if self.moe_single_grouped_bias and not self.moe_use_grouped_tensor:

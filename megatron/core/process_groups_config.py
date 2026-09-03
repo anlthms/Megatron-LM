@@ -201,6 +201,15 @@ class ProcessGroupCollection:
             else "ProcessGroupCollection(empty)"
         )
 
+    def __deepcopy__(self, memo):
+        """Keep process-group handles shared when copying model configuration.
+
+        Process groups are runtime communication resources, not configuration values. They cannot
+        be pickled or duplicated, and copied configs must continue to use the same communicators.
+        """
+        memo[id(self)] = self
+        return self
+
     @classmethod
     def use_mpu_process_groups(cls, required_pgs: Optional[List[str]] = None):
         """
