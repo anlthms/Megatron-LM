@@ -346,6 +346,14 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Initialization options.
         self.controller = controller
+        # Snapshot for the resume-time weight refresh: it runs on the coordinator
+        # thread, so it must not traverse a module tree the caller may be mutating
+        # (e.g. toggling CUDA-graph wrappers). The set is fixed at model build.
+        self._inference_grouped_mlp_modules = [
+            module
+            for module in unwrap_model(controller.inference_wrapped_model.model).modules()
+            if isinstance(module, InferenceGroupedMLP)
+        ]
         self.context = context
 
         self.num_speculative_tokens = inference_config.num_speculative_tokens
@@ -1245,11 +1253,13 @@ class DynamicInferenceEngine(AbstractEngine):
 
     @torch.no_grad()
     def _refresh_inference_grouped_mlp_weights(self) -> None:
-        """Refresh materialized serving buffers after the caller has synchronized weights."""
-        model = unwrap_model(self.controller.inference_wrapped_model.model)
-        for module in model.modules():
-            if isinstance(module, InferenceGroupedMLP):
-                module.refresh_inference_weights()
+        """Refresh materialized serving buffers after the caller has synchronized weights.
+
+        Iterates the snapshot taken at construction: this runs on the coordinator
+        thread, where traversing the live module tree races caller-side mutation.
+        """
+        for module in self._inference_grouped_mlp_modules:
+            module.refresh_inference_weights()
 
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
