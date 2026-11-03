@@ -391,6 +391,61 @@ class TestMoeAlignBlockSize:
 @pytest.mark.internal
 class TestMoeSum:
 
+    @pytest.mark.parametrize("apply_weights", [False, True])
+    @pytest.mark.parametrize("acc_fp64", [False, True])
+    @pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16])
+    def test_graph_replay_masks_nonlocal_slots_and_tail(self, apply_weights, acc_fp64, out_dtype):
+        from megatron.core.inference.moe.vllm_fused_moe import _moe_sum
+
+        # Multiple K tiles, a partial tile, and enough items to exercise grid striding.
+        max_tokens, topk, width = 513, 6, 1537
+        local_start, num_local = 3, 2
+        torch.manual_seed(123)
+        routes = torch.randint(0, 8, (max_tokens, topk), device="cuda")
+        local = (routes >= local_start) & (routes < local_start + num_local)
+        values = torch.randint(-8, 9, (max_tokens, topk, width), device="cuda").to(torch.bfloat16)
+        weights = torch.full((max_tokens, topk), 0.5, device="cuda")
+        # Invalid slots are undefined in production: neither input nor weight may be read.
+        values[~local] = float("nan")
+        weights[~local] = float("nan")
+        out = torch.empty(max_tokens, width, device="cuda", dtype=out_dtype)
+        valid = _vt(max_tokens)
+
+        def run():
+            return _moe_sum(
+                values.view(-1, width),
+                weights,
+                max_tokens,
+                topk,
+                width,
+                valid,
+                routes,
+                local_start,
+                num_local,
+                out=out,
+                apply_weights=apply_weights,
+                acc_fp64=acc_fp64,
+            )
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            run()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                run()
+        torch.cuda.current_stream().wait_stream(stream)
+        expected = torch.where(local[..., None], values.float(), 0).sum(dim=1)
+        if apply_weights:
+            expected *= 0.5
+        expected = expected.to(out_dtype)
+        for n in (max_tokens, 0, 1, 31, max_tokens):
+            valid.fill_(n)
+            out.fill_(-123)
+            graph.replay()
+            assert torch.equal(out[:n], expected[:n])
+            assert (out[n:] == -123).all()
+
     def _ref_moe_sum(
         self,
         input,

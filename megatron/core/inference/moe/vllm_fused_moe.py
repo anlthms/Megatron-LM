@@ -625,7 +625,6 @@ def _moe_sum_kernel(
     num_local_experts: tl.constexpr,
     K,
     topk: tl.constexpr,
-    BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     NUM_K_BLOCKS: tl.constexpr,
     APPLY_WEIGHTS: tl.constexpr = True,
@@ -637,49 +636,45 @@ def _moe_sum_kernel(
     output: [max_tokens, K] — dtype matches the output buffer (fp32 or bf16)
 
     For token t < valid_tokens: output[t] = sum of input[t*topk+k] * prob[t*topk+k]
-    over topk slots k where the expert is local.  Non-local slots are skipped
-    (their values in `input` are undefined because FC2 only processes
-    local-expert blocks).
+    over topk slots k where the expert is local.  Non-local slots contribute
+    nothing (their values in `input` are undefined because FC2 only processes
+    local-expert blocks, so they are masked out of the load, never read).
     Rows for t >= valid_tokens are not written; downstream consumers
     (e.g. reduce-scatter-v) only read the first valid_tokens rows.
-    Routing weight multiplication and accumulation in fp32 for numerical accuracy.
+    Routing weight multiplication and accumulation in fp32 for numerical accuracy;
+    each output element sums its slots in order 0..topk-1.
 
-    Persistent grid: launches BLOCK_M CTAs that stride over valid_tokens.
+    Persistent grid over (token, K-block) work items, so a small batch still
+    spreads over many CTAs.  The topk loads are branch-free masked loads, so
+    the compiler can schedule loads ahead of the ordered accumulation.
     CUDA-graph safe (grid is static); the loop bound is loaded device-side.
     """
     pid = tl.program_id(0)
+    num_programs = tl.num_programs(0)
     valid_tokens = tl.load(valid_tokens_ptr)
 
-    for token_id in tl.range(pid, valid_tokens, BLOCK_M):
+    for item in tl.range(pid, valid_tokens * NUM_K_BLOCKS, num_programs):
+        token_id = item // NUM_K_BLOCKS
+        k_idx = item % NUM_K_BLOCKS
         token_id_i64 = token_id.to(tl.int64)
         base = token_id_i64 * topk * K
+        offs_k = k_idx * BLOCK_K + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < K
 
-        # k_idx outer / topk inner keeps the live accumulator at one BLOCK_K tile.
-        # Swapping (topk outer) would need NUM_K_BLOCKS persistent accumulators
-        # (~NUM_K_BLOCKS * BLOCK_K * 4 B), which spills / cuts occupancy at large K.
-        for k_idx in range(NUM_K_BLOCKS):
-            offs_k = k_idx * BLOCK_K + tl.arange(0, BLOCK_K)
-            k_mask = offs_k < K
+        acc_dtype: tl.constexpr = tl.float64 if ACC_FP64 else tl.float32
+        acc = tl.zeros([BLOCK_K], dtype=acc_dtype)
+        for t in tl.static_range(topk):
+            eid = tl.load(routing_map_ptr + token_id * topk + t)
+            lid = eid - local_expert_start
+            is_local = (lid >= 0) & (lid < num_local_experts)
+            v = tl.load(input_ptr + base + t * K + offs_k, mask=k_mask & is_local, other=0.0)
+            value = v.to(acc_dtype)
+            if APPLY_WEIGHTS:
+                w = tl.load(topk_weights_ptr + token_id * topk + t, mask=is_local, other=0.0)
+                value *= w.to(acc_dtype)
+            acc += value
 
-            acc = tl.zeros([BLOCK_K], dtype=tl.float64 if ACC_FP64 else tl.float32)
-            for t in range(topk):
-                eid = tl.load(routing_map_ptr + token_id * topk + t)
-                lid = eid - local_expert_start
-                if lid >= 0 and lid < num_local_experts:
-                    v = tl.load(input_ptr + base + t * K + offs_k, mask=k_mask, other=0.0)
-                    if APPLY_WEIGHTS:
-                        w = tl.load(topk_weights_ptr + token_id * topk + t)
-                        if ACC_FP64:
-                            acc += v.to(tl.float64) * w.to(tl.float64)
-                        else:
-                            acc += v.to(tl.float32) * w
-                    else:
-                        if ACC_FP64:
-                            acc += v.to(tl.float64)
-                        else:
-                            acc += v.to(tl.float32)
-
-            tl.store(output_ptr + token_id_i64 * K + offs_k, acc.to(tl.float32), mask=k_mask)
+        tl.store(output_ptr + token_id_i64 * K + offs_k, acc.to(tl.float32), mask=k_mask)
 
 
 def _moe_sum(
@@ -719,8 +714,8 @@ def _moe_sum(
         out = VllmFusedMoeBuffers.get("moe_sum_out", (max_tokens, K), torch.float32, input.device)
     BLOCK_K = min(triton.next_power_of_2(K), 1024)
     NUM_K_BLOCKS = _ceil_div(K, BLOCK_K)
-    BLOCK_M = _get_num_sms(input.device)
-    _moe_sum_kernel[(BLOCK_M,)](
+    grid = 4 * _get_num_sms(input.device)
+    _moe_sum_kernel[(grid,)](
         input,
         out,
         topk_weights,
@@ -730,7 +725,6 @@ def _moe_sum(
         num_local_experts,
         K,
         topk=topk,
-        BLOCK_M=BLOCK_M,
         BLOCK_K=BLOCK_K,
         NUM_K_BLOCKS=NUM_K_BLOCKS,
         APPLY_WEIGHTS=apply_weights,
