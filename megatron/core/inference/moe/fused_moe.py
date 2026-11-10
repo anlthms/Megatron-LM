@@ -260,6 +260,7 @@ def mcore_fused_moe(
             alignment=expert_alignment,
             zero_padding=batch_invariant_mode,
             return_batch_invariant_inverse_map=batch_invariant_mode,
+            return_slot_map=True,
         )
         hidden_states, permuted_probs, permutation_map, offs = permuted[:4]
         batch_invariant_inverse_map = permuted[4] if batch_invariant_mode else None
@@ -275,11 +276,15 @@ def mcore_fused_moe(
             row_alignment=MXFP8_SCALE_ROW_BLOCK if use_mxfp8 else 1,
             zero_padding=batch_invariant_mode and use_mxfp8,
             return_batch_invariant_inverse_map=batch_invariant_mode,
+            return_slot_map=True,
         )
         hidden_states, permuted_probs, permutation_map, offs = permuted[:4]
         # Maps each (token, local expert) pair to its row in the expert-grouped buffer,
         # allowing batch-invariant unpermute to read contributions in fixed expert order.
         batch_invariant_inverse_map = permuted[4] if batch_invariant_mode else None
+    # Maps each (token, top-k slot) to its expert-grouped row (-1 when the expert is not
+    # local); the default unpermute gathers through it in slot order.
+    slot_map = permuted[-1]
 
     # --- FC1 -> activation -> FC2 ---
     # Quantize if MXFP8 path and hidden_states not already quantized (fused permute+quant
@@ -368,5 +373,6 @@ def mcore_fused_moe(
         ep_invariant_leaves=(
             batch_invariant_kwargs.leaves if batch_invariant_kwargs is not None else None
         ),
+        slot_map=slot_map,
     )
     return output

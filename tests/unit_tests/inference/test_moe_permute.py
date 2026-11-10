@@ -5,8 +5,8 @@
 Tests cover:
 - compute_local_tokens_per_expert: token counting against PyTorch reference
 - compute_expert_offsets: prefix sums with and without alignment
-- permute_tokens: expert grouping, data integrity, alignment padding
-- unpermute_tokens: weighted scatter-back, fp32 accumulation
+- permute_tokens: expert grouping, data integrity, alignment padding, slot map
+- unpermute_tokens: weighted gather through the slot map, fp32 accumulation
 - permute -> unpermute roundtrip
 """
 
@@ -47,6 +47,17 @@ def _make_inputs(num_tokens, hidden_dim, topk, num_experts, seed=42):
     probs = torch.rand(num_tokens, topk, device="cuda", dtype=torch.float32)
     routing_map = torch.randint(0, num_experts, (num_tokens, topk), device="cuda")
     return hidden, probs, routing_map
+
+
+def _slot_map_from_perm_map(perm_map, num_tokens, topk):
+    """Slot map for a hand-written permutation_map: each token's rows in increasing order."""
+    slot_map = torch.full((num_tokens, topk), -1, dtype=torch.int32, device="cuda")
+    fill = [0] * num_tokens
+    for row, tok in enumerate(perm_map.tolist()):
+        if tok >= 0:
+            slot_map[tok, fill[tok]] = row
+            fill[tok] += 1
+    return slot_map
 
 
 def test_batch_invariant_squared_relu_applies_probs_before_fc2():
@@ -535,6 +546,65 @@ class TestPermuteTokens:
 
 
 @pytest.mark.internal
+class TestSlotMap:
+
+    @pytest.mark.parametrize(
+        "num_tokens,topk,num_experts,local_start,num_local,alignment",
+        [
+            (64, 4, 8, 0, 8, 1),
+            (64, 4, 8, 4, 4, 32),
+            (300, 6, 128, 96, 32, 128),
+            (1, 2, 4, 0, 4, 16),
+        ],
+    )
+    def test_slot_map_indexes_each_local_pair(
+        self, num_tokens, topk, num_experts, local_start, num_local, alignment
+    ):
+        """slot_map[t, k] is the permuted row of (t, k) for local experts and -1 otherwise."""
+        from megatron.core.inference.moe.permute import permute_tokens
+
+        hidden, probs, routing_map = _make_inputs(num_tokens, 64, topk, num_experts)
+        _, perm_p, perm_map, offs, slot_map = permute_tokens(
+            hidden,
+            probs,
+            routing_map,
+            local_start,
+            num_local,
+            _vt(num_tokens),
+            alignment=alignment,
+            return_slot_map=True,
+        )
+        is_local = (routing_map >= local_start) & (routing_map < local_start + num_local)
+        assert slot_map.shape == (num_tokens, topk) and slot_map.dtype == torch.int32
+        assert torch.equal(slot_map >= 0, is_local)
+        rows = slot_map[is_local].long()
+        assert rows.unique().numel() == rows.numel()
+        if rows.numel() > 0:
+            assert rows.max().item() < offs[-1].item()
+        tokens = is_local.nonzero(as_tuple=True)[0].to(torch.int32)
+        assert torch.equal(perm_map[rows], tokens)
+        assert torch.equal(perm_p[rows], probs[is_local])
+
+    def test_unpermute_writes_only_valid_rows(self):
+        """Only the first valid_tokens rows are read from the slot map and written to out."""
+        from megatron.core.inference.moe.permute import permute_tokens, unpermute_tokens
+
+        num_tokens, topk, hidden_dim, valid = 16, 2, 32, 5
+        hidden, probs, routing_map = _make_inputs(num_tokens, hidden_dim, topk, 4)
+        perm_h, perm_p, perm_map, offs, slot_map = permute_tokens(
+            hidden, probs, routing_map, 0, 4, _vt(valid), return_slot_map=True
+        )
+        assert torch.all(slot_map[:valid] >= 0)
+        out = torch.full((num_tokens, hidden_dim), 7.0, device="cuda", dtype=torch.float32)
+        unpermute_tokens(
+            perm_h, perm_p, perm_map, num_tokens, offs[-1:], _vt(valid), out=out, slot_map=slot_map
+        )
+        ref = hidden[:valid].float() * probs[:valid].sum(dim=1, keepdim=True)
+        torch.testing.assert_close(out[:valid], ref, atol=1e-2, rtol=1e-2)
+        assert torch.all(out[valid:] == 7.0)
+
+
+@pytest.mark.internal
 class TestUnpermuteTokens:
 
     def test_weighted_scatter(self):
@@ -548,7 +618,13 @@ class TestUnpermuteTokens:
         perm_map = torch.tensor([0, 0, 2], dtype=torch.int32, device="cuda")
 
         result = unpermute_tokens(
-            expert_output, permuted_probs, perm_map, num_tokens, _vt(3), _vt(num_tokens)
+            expert_output,
+            permuted_probs,
+            perm_map,
+            num_tokens,
+            _vt(3),
+            _vt(num_tokens),
+            slot_map=_slot_map_from_perm_map(perm_map, num_tokens, 2),
         )
 
         assert result.dtype == torch.float32
@@ -571,7 +647,15 @@ class TestUnpermuteTokens:
         permuted_probs = torch.ones(4, device="cuda", dtype=torch.float32)
         perm_map = torch.tensor([0, -1, -1, 1], dtype=torch.int32, device="cuda")
 
-        result = unpermute_tokens(expert_output, permuted_probs, perm_map, 3, _vt(4), _vt(3))
+        result = unpermute_tokens(
+            expert_output,
+            permuted_probs,
+            perm_map,
+            3,
+            _vt(4),
+            _vt(3),
+            slot_map=_slot_map_from_perm_map(perm_map, 3, 1),
+        )
         # Only tokens 0 and 1 get values
         assert result[0].sum().item() != 0
         assert result[1].sum().item() != 0
@@ -588,7 +672,13 @@ class TestUnpermuteTokens:
         perm_map = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device="cuda")
 
         result = unpermute_tokens(
-            expert_output, permuted_probs, perm_map, num_tokens, _vt(4), _vt(num_tokens)
+            expert_output,
+            permuted_probs,
+            perm_map,
+            num_tokens,
+            _vt(4),
+            _vt(num_tokens),
+            slot_map=_slot_map_from_perm_map(perm_map, num_tokens, 1),
         )
         assert result.shape == (num_tokens, hidden_dim)
         # First 4 tokens should have values, rest should be zero
@@ -608,7 +698,15 @@ class TestUnpermuteTokens:
         probs = torch.full((topk,), 0.1, device="cuda", dtype=torch.float32)
         perm_map = torch.zeros(topk, dtype=torch.int32, device="cuda")
 
-        result = unpermute_tokens(expert_output, probs, perm_map, 1, _vt(topk), _vt(1))
+        result = unpermute_tokens(
+            expert_output,
+            probs,
+            perm_map,
+            1,
+            _vt(topk),
+            _vt(1),
+            slot_map=_slot_map_from_perm_map(perm_map, 1, topk),
+        )
         expected_val = 0.1 * topk
         torch.testing.assert_close(
             result[0], torch.full((hidden_dim,), expected_val, device="cuda"), atol=1e-4, rtol=1e-4
@@ -689,11 +787,20 @@ class TestPermuteUnpermuteRoundtrip:
         probs = torch.rand(num_tokens, topk, device="cuda", dtype=torch.float32)
         routing_map = torch.randint(0, num_experts, (num_tokens, topk), device="cuda")
 
-        perm_h, perm_p, perm_map, offs = permute_tokens(
-            hidden, probs, routing_map, 0, num_experts, _vt(num_tokens), alignment=alignment
+        perm_h, perm_p, perm_map, offs, slot_map = permute_tokens(
+            hidden,
+            probs,
+            routing_map,
+            0,
+            num_experts,
+            _vt(num_tokens),
+            alignment=alignment,
+            return_slot_map=True,
         )
         # Pass permuted hidden directly through (identity expert)
-        result = unpermute_tokens(perm_h, perm_p, perm_map, num_tokens, offs[-1:], _vt(num_tokens))
+        result = unpermute_tokens(
+            perm_h, perm_p, perm_map, num_tokens, offs[-1:], _vt(num_tokens), slot_map=slot_map
+        )
 
         # Build reference: for each token, sum prob[k] * hidden[token] over topk
         ref = torch.zeros(num_tokens, hidden_dim, device="cuda", dtype=torch.float32)
@@ -717,10 +824,19 @@ class TestPermuteUnpermuteRoundtrip:
         probs = torch.rand(num_tokens, topk, device="cuda", dtype=torch.float32)
         routing_map = torch.randint(0, num_experts, (num_tokens, topk), device="cuda")
 
-        perm_h, perm_p, perm_map, offs = permute_tokens(
-            hidden, probs, routing_map, local_start, num_local, _vt(num_tokens), alignment=32
+        perm_h, perm_p, perm_map, offs, slot_map = permute_tokens(
+            hidden,
+            probs,
+            routing_map,
+            local_start,
+            num_local,
+            _vt(num_tokens),
+            alignment=32,
+            return_slot_map=True,
         )
-        result = unpermute_tokens(perm_h, perm_p, perm_map, num_tokens, offs[-1:], _vt(num_tokens))
+        result = unpermute_tokens(
+            perm_h, perm_p, perm_map, num_tokens, offs[-1:], _vt(num_tokens), slot_map=slot_map
+        )
 
         # Reference: only accumulate probs for local experts
         ref = torch.zeros(num_tokens, hidden_dim, device="cuda", dtype=torch.float32)
